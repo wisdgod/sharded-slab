@@ -208,6 +208,8 @@ pub(crate) mod cfg;
 pub(crate) mod sync;
 
 mod clear;
+#[cfg(doctest)]
+mod compile_fail;
 mod iter;
 mod page;
 mod shard;
@@ -758,8 +760,33 @@ impl<T: fmt::Debug, C: cfg::Config> fmt::Debug for Slab<T, C> {
     }
 }
 
+// === Send / Sync ===
+//
+// A `Slab` hands out `&T` to any thread (requiring `T: Sync`), and moves and
+// drops values on whichever thread calls `take`, `remove`, or drops the last
+// reference to a removed value (requiring `T: Send`).
+//
+// A guard sent to another thread lets that thread access the slab, both to
+// read the value and to drop it on release, so guards are `Send` only if the
+// slab could be shared (`T: Send + Sync`). Sharing a guard only shares `&T`.
+
+// SAFETY: moving the slab moves its values along with it.
 unsafe impl<T: Send, C: cfg::Config> Send for Slab<T, C> {}
-unsafe impl<T: Sync, C: cfg::Config> Sync for Slab<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync, C: cfg::Config> Sync for Slab<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync, C: cfg::Config> Send for Entry<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync, C: cfg::Config> Sync for Entry<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync, C: cfg::Config> Send for OwnedEntry<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync, C: cfg::Config> Sync for OwnedEntry<T, C> {}
+// SAFETY: a `VacantEntry` only moves a `T` into the slab on `insert`, and
+// provides no access to any value through `&self`.
+unsafe impl<T: Send, C: cfg::Config> Send for VacantEntry<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T, C: cfg::Config> Sync for VacantEntry<'_, T, C> {}
 
 // === impl Entry ===
 
@@ -803,13 +830,6 @@ where
     fn eq(&self, other: &T) -> bool {
         self.value().eq(other)
     }
-}
-
-unsafe impl<T, C> Send for Entry<'_, T, C>
-where
-    T: Sync,
-    C: cfg::Config,
-{
 }
 
 // === impl VacantEntry ===
@@ -923,20 +943,6 @@ where
     fn eq(&self, other: &T) -> bool {
         *self.value() == *other
     }
-}
-
-unsafe impl<T, C> Sync for OwnedEntry<T, C>
-where
-    T: Sync,
-    C: cfg::Config,
-{
-}
-
-unsafe impl<T, C> Send for OwnedEntry<T, C>
-where
-    T: Sync,
-    C: cfg::Config,
-{
 }
 
 /// Generate bit mask with `len` 1 bits. (Rust 1.42.0 compatible)

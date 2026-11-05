@@ -813,18 +813,37 @@ where
     }
 }
 
-unsafe impl<T, C> Send for Pool<T, C>
-where
-    T: Send + Clear + Default,
-    C: cfg::Config,
-{
-}
-unsafe impl<T, C> Sync for Pool<T, C>
-where
-    T: Sync + Clear + Default,
-    C: cfg::Config,
-{
-}
+// === Send / Sync ===
+//
+// A `Pool` hands out `&T` to any thread (requiring `T: Sync`), and `&mut T`
+// (through `RefMut` and `Clear::clear`) to whichever thread creates or clears
+// a value (requiring `T: Send`).
+//
+// A guard sent to another thread lets that thread access the pool, both to
+// access the value and to clear it on release, so guards are `Send` only if
+// the pool could be shared (`T: Send + Sync`). Sharing a guard only shares
+// `&T`.
+
+// SAFETY: see above.
+unsafe impl<T: Send + Clear + Default, C: cfg::Config> Send for Pool<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync + Clear + Default, C: cfg::Config> Sync for Pool<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync + Clear + Default, C: cfg::Config> Send for Ref<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync + Clear + Default, C: cfg::Config> Sync for Ref<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync + Clear + Default, C: cfg::Config> Send for RefMut<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync + Clear + Default, C: cfg::Config> Sync for RefMut<'_, T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync + Clear + Default, C: cfg::Config> Send for OwnedRef<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync + Clear + Default, C: cfg::Config> Sync for OwnedRef<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Send + Sync + Clear + Default, C: cfg::Config> Send for OwnedRefMut<T, C> {}
+// SAFETY: see above.
+unsafe impl<T: Sync + Clear + Default, C: cfg::Config> Sync for OwnedRefMut<T, C> {}
 
 impl<T> Default for Pool<T>
 where
@@ -1065,20 +1084,6 @@ where
     }
 }
 
-unsafe impl<T, C> Sync for OwnedRef<T, C>
-where
-    T: Sync + Clear + Default,
-    C: cfg::Config,
-{
-}
-
-unsafe impl<T, C> Send for OwnedRef<T, C>
-where
-    T: Sync + Clear + Default,
-    C: cfg::Config,
-{
-}
-
 // === impl OwnedRefMut ===
 
 impl<T, C> OwnedRefMut<T, C>
@@ -1195,18 +1200,4 @@ where
     fn eq(&self, other: &T) -> bool {
         *self.value() == *other
     }
-}
-
-unsafe impl<T, C> Sync for OwnedRefMut<T, C>
-where
-    T: Sync + Clear + Default,
-    C: cfg::Config,
-{
-}
-
-unsafe impl<T, C> Send for OwnedRefMut<T, C>
-where
-    T: Sync + Clear + Default,
-    C: cfg::Config,
-{
 }
