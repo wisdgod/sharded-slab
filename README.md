@@ -2,21 +2,13 @@
 
 A lock-free concurrent slab.
 
-[![Crates.io][crates-badge]][crates-url]
-[![Documentation][docs-badge]][docs-url]
 [![CI Status][ci-badge]][ci-url]
-[![GitHub License][license-badge]][license]
-![maintenance status][maint-badge]
+[![License: MIT][license-badge]][license]
 
-[crates-badge]: https://img.shields.io/crates/v/sharded-slab.svg
-[crates-url]: https://crates.io/crates/sharded-slab
-[docs-badge]: https://docs.rs/sharded-slab/badge.svg
-[docs-url]: https://docs.rs/sharded-slab/latest
-[ci-badge]: https://github.com/hawkw/sharded-slab/workflows/CI/badge.svg
-[ci-url]: https://github.com/hawkw/sharded-slab/actions?workflow=CI
-[license-badge]: https://img.shields.io/crates/l/sharded-slab
+[ci-badge]: https://github.com/wisdgod/sharded-slab/actions/workflows/ci.yml/badge.svg
+[ci-url]: https://github.com/wisdgod/sharded-slab/actions/workflows/ci.yml
+[license-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [license]: LICENSE
-[maint-badge]: https://img.shields.io/badge/maintenance-experimental-blue.svg
 
 Slabs provide pre-allocated storage for many instances of a single data
 type. When a large number of values of a single type are required,
@@ -38,11 +30,26 @@ optimization, and there may still be some lurking bugs.
 
 ## Usage
 
-First, add this to your `Cargo.toml`:
+This fork is not published to crates.io. Depend on it from git:
 
 ```toml
-sharded-slab = "0.1.7"
+[dependencies]
+sharded-slab = { git = "https://github.com/wisdgod/sharded-slab" }
 ```
+
+Or, to use it in place of upstream everywhere in your dependency graph
+(for example, under `tracing-subscriber`), patch it in your workspace's
+`Cargo.toml`:
+
+```toml
+[patch.crates-io]
+sharded-slab = { git = "https://github.com/wisdgod/sharded-slab" }
+```
+
+The version stays semver-compatible with upstream's `0.1`, so the patch
+applies to every dependent on `sharded-slab = "0.1"`. Within that version,
+only the API that `tracing-subscriber` uses is kept compatible; its test
+suite passes against this fork.
 
 This crate provides two types, [`Slab`] and [`Pool`], which provide slightly
 different APIs for using a sharded slab. 

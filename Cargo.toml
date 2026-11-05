@@ -1,11 +1,10 @@
 [package]
 name = "sharded-slab"
-version = "0.1.7"
+version = "0.1.8"
 authors = ["Eliza Weisman <eliza@buoyant.io>"]
 edition = "2024"
 rust-version = "1.99"
-documentation = "https://docs.rs/sharded-slab/"
-repository = "https://github.com/hawkw/sharded-slab"
+repository = "https://github.com/wisdgod/sharded-slab"
 readme = "README.md"
 license = "MIT"
 keywords = ["slab", "allocator", "lock-free", "atomic"]
