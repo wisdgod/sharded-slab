@@ -2,7 +2,10 @@ use crate::{
     Pack,
     cfg::{self, CfgPrivate},
     clear::Clear,
-    page::{self, FreeList, Slot, slot::Value},
+    page::{
+        self, FreeList, Slot,
+        slot::{Get, Value},
+    },
     sync::{
         alloc,
         atomic::{
@@ -153,9 +156,15 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
     /// Acquires a shared reference to the value at `key`.
     #[inline]
     pub(crate) fn get(&self, key: usize) -> Option<Guard<T, C>> {
-        let (_, slot) = self.slot(key)?;
-        if !slot.get(C::unpack_gen(key)) {
-            return None;
+        let (page_index, slot) = self.slot(key)?;
+        match slot.get(C::unpack_gen(key)) {
+            Get::Acquired => {}
+            Get::Absent => return None,
+            Get::Claimed => {
+                // SAFETY: undoing our speculative reference claimed the slot.
+                unsafe { self.free(key, page_index, slot) };
+                return None;
+            }
         }
         Some(Guard {
             shard: NonNull::from(self),

@@ -214,3 +214,41 @@ fn values_dropped_exactly_once() {
     }
     assert_eq!(live(), 0, "values leaked when the slab was dropped");
 }
+
+/// Reaching the maximum number of references makes `get` fail (without
+/// overflowing into the generation) until one is released, and makes `clone`
+/// panic.
+#[test]
+fn max_refs() {
+    use crate::page::slot::RefCount;
+
+    // The generation is capped so that this config's count has 16 bits.
+    struct LargeGenConfig;
+    impl crate::Config for LargeGenConfig {
+        const INITIAL_PAGE_SIZE: usize = 2;
+        const MAX_THREADS: usize = 32;
+        const MAX_PAGES: usize = 2;
+    }
+
+    let slab = Slab::new_with_config::<LargeGenConfig>();
+    let key = slab.insert("hello world").unwrap();
+    let max = RefCount::<LargeGenConfig>::MAX;
+    let mut refs: Vec<_> = (0..max).map(|_| slab.get(key).unwrap()).collect();
+    assert!(slab.get(key).is_none());
+    assert!(
+        slab.contains(key),
+        "a failed `get` must not corrupt the slot"
+    );
+
+    let clone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refs[0].clone()));
+    assert!(clone.is_err(), "cloning past the maximum must panic");
+
+    drop(refs.pop());
+    let last = slab
+        .get(key)
+        .expect("a released reference can be reacquired");
+    assert!(slab.get(key).is_none());
+    drop((last, refs));
+    assert!(slab.remove(key));
+    assert!(slab.get(key).is_none());
+}

@@ -100,11 +100,6 @@ pub(crate) trait CfgPrivate: Config {
             Self::INITIAL_SZ <= Addr::<Self>::BITS,
             "invalid `Config`: `INITIAL_PAGE_SIZE` is too large",
         );
-        assert!(
-            RefCount::<Self>::MAX > 1,
-            "invalid `Config`: too few bits are left for reference counts; \
-             decrease `MAX_PAGES`, `MAX_THREADS`, or `INITIAL_PAGE_SIZE`",
-        );
     };
 
     fn page_size(n: usize) -> usize {
@@ -209,8 +204,8 @@ mod tests {
         assert_eq!(DefaultConfig::INITIAL_SZ, 32);
         assert_eq!(DefaultConfig::ADDR_INDEX_SHIFT, 6);
         assert_eq!(DefaultConfig::USED_BITS, WIDTH);
-        assert_eq!(RefCount::<DefaultConfig>::LEN, 28);
-        assert_eq!(Lifecycle::<DefaultConfig>::LEN, 2);
+        assert_eq!(RefCount::<DefaultConfig>::LEN, 27);
+        assert_eq!(Lifecycle::<DefaultConfig>::LEN, 3);
         assert_eq!(LifecycleGen::<DefaultConfig>::LEN, 2);
         assert_eq!(Generation::<DefaultConfig>::LEN, 2);
         assert_eq!(Tid::<DefaultConfig>::LEN, 8);
@@ -227,8 +222,8 @@ mod tests {
         assert_eq!(DefaultConfig::INITIAL_SZ, 32);
         assert_eq!(DefaultConfig::ADDR_INDEX_SHIFT, 6);
         assert_eq!(DefaultConfig::USED_BITS, WIDTH);
-        assert_eq!(RefCount::<DefaultConfig>::LEN, 49);
-        assert_eq!(Lifecycle::<DefaultConfig>::LEN, 2);
+        assert_eq!(RefCount::<DefaultConfig>::LEN, 48);
+        assert_eq!(Lifecycle::<DefaultConfig>::LEN, 3);
         assert_eq!(LifecycleGen::<DefaultConfig>::LEN, 13);
         assert_eq!(Generation::<DefaultConfig>::LEN, 13);
         assert_eq!(Tid::<DefaultConfig>::LEN, 13);
@@ -249,22 +244,14 @@ mod tests {
         assert_eq!(GiantGenConfig::MAX_SHARDS, 1);
         assert_eq!(GiantGenConfig::MAX_THREADS, 1);
         assert_eq!(GiantGenConfig::INITIAL_PAGE_SIZE, 1);
-        assert_eq!(GiantGenConfig::USED_BITS, WIDTH);
         assert_eq!(GiantGenConfig::INITIAL_SZ, 1);
         assert_eq!(GiantGenConfig::ADDR_INDEX_SHIFT, 1);
-        assert_eq!(RefCount::<GiantGenConfig>::LEN, 0);
-        assert_eq!(
-            LifecycleGen::<GiantGenConfig>::LEN,
-            WIDTH - RefCount::<GiantGenConfig>::LEN - Lifecycle::<GiantGenConfig>::LEN
-        );
-        assert_eq!(Lifecycle::<GiantGenConfig>::LEN, 2);
-        assert_eq!(
-            Generation::<GiantGenConfig>::LEN,
-            WIDTH
-                - GiantGenConfig::RESERVED_BITS
-                - Tid::<GiantGenConfig>::LEN
-                - Addr::<GiantGenConfig>::LEN
-        );
+        // The generation does not take all the remaining key bits, but is
+        // capped so that the reference count keeps 16 bits.
+        assert_eq!(RefCount::<GiantGenConfig>::LEN, 16);
+        assert_eq!(Lifecycle::<GiantGenConfig>::LEN, 3);
+        assert_eq!(Generation::<GiantGenConfig>::LEN, WIDTH - 3 - 16);
+        const { assert!(GiantGenConfig::USED_BITS < WIDTH) };
         assert_eq!(Tid::<GiantGenConfig>::LEN, 0);
         assert_eq!(Addr::<GiantGenConfig>::LEN, 2);
     }

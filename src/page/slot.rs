@@ -2,36 +2,40 @@
 //!
 //! Every slot has a `lifecycle` word packing `[generation | refs | state]`:
 //!
-//! | state       | meaning                                                      |
-//! |-------------|--------------------------------------------------------------|
-//! | `Present`   | holds a published value; `refs` readers are accessing it     |
-//! | `Marked`    | removal was requested; `refs > 0` readers still access it,   |
-//! |             | or `refs == 0` while an `InitGuard` holds exclusive access   |
-//! | `Exclusive` | an `InitGuard` holds exclusive access; not yet published     |
-//! | `Vacant`    | owned by whoever *claimed* it (or by a free list)            |
+//! | state             | meaning                                                |
+//! |-------------------|--------------------------------------------------------|
+//! | `Present`         | holds a published value                                |
+//! | `Marked`          | removal was requested; the last reference claims it    |
+//! | `Exclusive`       | an `InitGuard` holds exclusive access; not published   |
+//! | `ExclusiveMarked` | removal was requested while exclusively held           |
+//! | `Vacant`          | owned by whoever *claimed* it (or by a free list)      |
 //!
 //! The central invariant: the generation advances **only** when a slot is
-//! claimed (moved to `Vacant`), and exactly one party claims each generation.
-//! The claimer has exclusive access to the item until it pushes the slot onto
-//! a free list, and keys for the old generation can never observe the slot
-//! again. No operation other than `init` (on a slot popped from a free list)
-//! moves a slot out of `Vacant`.
+//! *claimed* (moved to `Vacant`), with a CAS, so exactly one party claims
+//! each generation. The claimer has exclusive access to the item until it
+//! pushes the slot onto a free list, and keys for the old generation can
+//! never observe the slot again.
+//!
+//! `get` increments `refs` with `fetch_add` *before* checking the state, and
+//! undoes the increment through `release` if the value is not present. So
+//! `refs` counts guards plus in-flight speculative increments, in any state:
+//! every transition preserves `refs`, and nothing but `get` and guards ever
+//! touches the count. Speculative increments never access the item.
 //!
 //! Transitions (`g` is the key's generation, `r` the reference count):
 //!
-//! - `get`: `Present(g, r)` → `Present(g, r + 1)`
-//! - `release`: `Marked(g, 1)` → `Vacant(g + 1, 0)`, claiming the slot;
-//!   otherwise `r` → `r - 1`
+//! - `get`: `r` → `r + 1` (then undone unless `Present(g)`)
+//! - `release`: `r` → `r - 1`; the one that leaves `Marked(g, 0)` then tries
+//!   to claim it with a CAS to `Vacant(g + 1, 0)`
 //! - `mark`: `Present(g, 0)` → `Vacant(g + 1, 0)`, claiming the slot;
 //!   `Present(g, r > 0)` → `Marked`; and only if requested (for `Pool`, whose
-//!   exclusively held values exist), `Exclusive(g)` → `Marked`
-//! - `claim` (blocking `take`): `Present(g, r)` / `Marked(g, r > 0)` →
+//!   exclusively held values exist), `Exclusive(g)` → `ExclusiveMarked`
+//! - `claim` (blocking `take`): `Present(g, r)` / `Marked(g, r)` →
 //!   `Vacant(g + 1, r)`, then wait for `r` to drain to zero
-//! - `init`: `Vacant(g, 0)` → `Exclusive(g)`
-//! - `publish`: `Exclusive(g)` → `Present(g, r)`; if it was marked meanwhile,
-//!   `Marked(g, 0)` → `Vacant(g + 1, 0)` (claimed), or for a downgrade, →
-//!   `Marked(g, 1)`, so the downgraded reference claims it on release
-//! - `discard`: `Exclusive(g)` / `Marked(g, 0)` → `Vacant(g + 1, 0)` (claimed)
+//! - `init`: `Vacant(g)` → `Exclusive(g)`
+//! - `publish`: `Exclusive(g)` → `Present(g)`; `ExclusiveMarked(g)` →
+//!   `Vacant(g + 1)` (claimed), or for a downgrade, → `Marked(g, r + 1)`
+//! - `discard`: `Exclusive(g)` / `ExclusiveMarked(g)` → `Vacant(g + 1)`
 use crate::sync::{
     UnsafeCell,
     atomic::{AtomicUsize, Ordering::*},
@@ -39,6 +43,11 @@ use crate::sync::{
 };
 use crate::{Pack, Tid, cfg, clear::Clear};
 use std::{fmt, marker::PhantomData, mem::MaybeUninit};
+
+/// The minimum width of the reference count. Speculative increments may
+/// overshoot `RefCount::MAX` by one per concurrently running thread before
+/// they are undone, so the count needs ample headroom.
+const MIN_REF_BITS: usize = 16;
 
 pub(crate) struct Slot<T, C> {
     lifecycle: AtomicUsize,
@@ -71,10 +80,11 @@ pub(crate) struct LifecycleGen<C>(Generation<C>);
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 #[repr(usize)]
 enum State {
-    Present = 0b00,
-    Marked = 0b01,
-    Exclusive = 0b10,
-    Vacant = 0b11,
+    Present = 0b000,
+    Marked = 0b001,
+    Exclusive = 0b010,
+    ExclusiveMarked = 0b011,
+    Vacant = 0b100,
 }
 
 /// An unpacked snapshot of a slot's `lifecycle` word.
@@ -93,14 +103,20 @@ impl<C> Clone for Word<C> {
 impl<C> Copy for Word<C> {}
 
 impl<C: cfg::Config> Pack<C> for Generation<C> {
-    /// Use all the remaining bits in the word for the generation counter, minus
-    /// any bits reserved by the user.
+    /// Use all the remaining bits in the key for the generation counter, minus
+    /// any bits reserved by the user, but leave at least [`MIN_REF_BITS`] for
+    /// the reference count in the lifecycle word (which also stores the
+    /// generation); any key bits beyond that stay unused.
     ///
     /// Saturating, so that an invalid `Config` is reported by
     /// `CfgPrivate::VALIDATE` instead of an overflow here.
-    const LEN: usize = cfg::WIDTH
-        .saturating_sub(C::RESERVED_BITS)
-        .saturating_sub(Self::SHIFT);
+    const LEN: usize = {
+        let room = cfg::WIDTH
+            .saturating_sub(C::RESERVED_BITS)
+            .saturating_sub(Self::SHIFT);
+        let cap = cfg::WIDTH - Lifecycle::<C>::LEN - MIN_REF_BITS;
+        if room < cap { room } else { cap }
+    };
 
     type Prev = Tid<C>;
 
@@ -172,6 +188,9 @@ impl<C: cfg::Config> Word<C> {
 
 // Slot methods which should work across all trait bounds
 impl<T, C: cfg::Config> Slot<T, C> {
+    /// The lifecycle word delta of one reference.
+    const REF: usize = 1 << RefCount::<C>::SHIFT;
+
     pub(in crate::page) fn new(next: usize) -> Self
     where
         T: Default,
@@ -202,6 +221,22 @@ impl<T, C: cfg::Config> Slot<T, C> {
             .compare_exchange(current.pack(), new.pack(), AcqRel, Acquire)
             .map(drop)
             .map_err(Word::unpack)
+    }
+
+    /// Applies `f` to the lifecycle word with a CAS loop, until it succeeds
+    /// or `f` returns `None`. Returns the word `f` was last applied to.
+    #[inline(always)]
+    fn update(&self, mut f: impl FnMut(Word<C>) -> Option<Word<C>>) -> Result<Word<C>, Word<C>> {
+        let mut word = self.load(Acquire);
+        loop {
+            let Some(new) = f(word) else {
+                return Err(word);
+            };
+            match self.cas(word, new) {
+                Ok(()) => return Ok(word),
+                Err(actual) => word = actual,
+            }
+        }
     }
 
     #[inline(always)]
@@ -253,23 +288,24 @@ impl<T, C: cfg::Config> Slot<T, C> {
 
     /// Acquires a shared reference to the slot's value at `generation`.
     ///
-    /// Returns `false` if the generation is stale, the value is not present,
-    /// or the maximum number of references is reached.
+    /// The reference count is incremented speculatively, whatever the state,
+    /// and the increment undone (with [`Slot::release`]) if the value turns
+    /// out not to be present: unlike a CAS loop, this never retries under
+    /// contention.
     #[inline]
-    pub(crate) fn get(&self, generation: Generation<C>) -> bool {
-        let mut word = self.load(Acquire);
-        loop {
-            test_println!("-> get {:?}; lifecycle={:?}", generation, word);
-            if word.generation != generation || word.state != State::Present {
-                return false;
-            }
-            let Some(refs) = RefCount::<C>::from_usize(word.refs).incr() else {
-                return false;
-            };
-            match self.cas(word, word.with_refs(refs.value)) {
-                Ok(()) => return true,
-                Err(actual) => word = actual,
-            }
+    pub(crate) fn get(&self, generation: Generation<C>) -> Get {
+        let prev = Word::<C>::unpack(self.lifecycle.fetch_add(Self::REF, Acquire));
+        test_println!("-> get {:?}; lifecycle={:?}", generation, prev);
+        if prev.generation == generation
+            && prev.state == State::Present
+            && prev.refs < RefCount::<C>::MAX
+        {
+            return Get::Acquired;
+        }
+        if self.release() {
+            Get::Claimed
+        } else {
+            Get::Absent
         }
     }
 
@@ -279,47 +315,34 @@ impl<T, C: cfg::Config> Slot<T, C> {
     ///
     /// If the maximum number of references would be exceeded.
     pub(crate) fn clone_ref(&self) {
-        let mut word = self.load(Relaxed);
-        loop {
-            debug_assert!(word.refs > 0, "cloning a reference to an unreferenced slot");
-            let refs = RefCount::<C>::from_usize(word.refs)
-                .incr()
-                .expect("exceeded the maximum number of concurrent references to a slot");
-            // No synchronization is needed: the caller's existing reference
-            // keeps the value alive (as with `Arc::clone`).
-            match self.lifecycle.compare_exchange_weak(
-                word.pack(),
-                word.with_refs(refs.value).pack(),
-                Relaxed,
-                Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => word = Word::unpack(actual),
-            }
+        // No synchronization is needed: the caller's existing reference keeps
+        // the value alive (as with `Arc::clone`).
+        let prev = Word::<C>::unpack(self.lifecycle.fetch_add(Self::REF, Relaxed));
+        if prev.refs >= RefCount::<C>::MAX {
+            let claimed = self.release();
+            debug_assert!(!claimed, "the caller still holds a reference");
+            panic!("exceeded the maximum number of concurrent references to a slot");
         }
     }
 
-    /// Drops a shared reference.
+    /// Drops a shared reference (or undoes a speculative increment).
     ///
-    /// Returns `true` if the caller claimed the slot (it was the last
+    /// Returns `true` if the caller claimed the slot (it released the last
     /// reference to a marked slot) and must now clear and free it.
     #[inline]
     pub(crate) fn release(&self) -> bool {
-        let mut word = self.load(Relaxed);
-        loop {
-            debug_assert!(word.refs > 0, "released an unreferenced slot: {word:?}");
-            let claim = word.refs == 1 && word.state == State::Marked;
-            let new = if claim {
-                word.claimed(0)
-            } else {
-                word.with_refs(word.refs - 1)
-            };
-            test_println!("-> release: {:?} -> {:?}", word, new);
-            match self.cas(word, new) {
-                Ok(()) => return claim,
-                Err(actual) => word = actual,
-            }
+        let prev = Word::<C>::unpack(self.lifecycle.fetch_sub(Self::REF, AcqRel));
+        debug_assert!(prev.refs > 0, "released an unreferenced slot: {prev:?}");
+        test_println!("-> release: {:?}", prev);
+        if prev.state != State::Marked || prev.refs != 1 {
+            return false;
         }
+        // We released the last reference to a marked slot. A speculative
+        // `get` may increment the count again before we claim it, in which
+        // case its undo will reach zero and try to claim it in turn; and only
+        // one party can win the CAS from this exact word.
+        let last = prev.with_refs(0);
+        self.cas(last, last.claimed(0)).is_ok()
     }
 
     /// Marks the value at `generation` for removal.
@@ -331,24 +354,39 @@ impl<T, C: cfg::Config> Slot<T, C> {
     /// the caller claimed the slot and must now clear and free it, or
     /// `Some(false)` if it will be claimed by whoever releases it last.
     pub(crate) fn mark(&self, generation: Generation<C>, exclusive: bool) -> Option<bool> {
-        let mut word = self.load(Acquire);
-        loop {
+        let mut claim = false;
+        let mut absent = false;
+        let result = self.update(|word| {
             test_println!("-> mark {:?}; lifecycle={:?}", generation, word);
+            (claim, absent) = (false, false);
             if word.generation != generation {
+                absent = true;
                 return None;
             }
-            let (new, claim) = match word.state {
-                State::Vacant => return None,
-                State::Marked => return Some(false),
-                State::Present if word.refs == 0 => (word.claimed(0), true),
-                State::Present => (word.with_state(State::Marked), false),
-                State::Exclusive if exclusive => (word.with_state(State::Marked), false),
-                State::Exclusive => return None,
-            };
-            match self.cas(word, new) {
-                Ok(()) => return Some(claim),
-                Err(actual) => word = actual,
+            match word.state {
+                State::Vacant => {
+                    absent = true;
+                    None
+                }
+                State::Marked | State::ExclusiveMarked => None,
+                State::Present if word.refs == 0 => {
+                    claim = true;
+                    Some(word.claimed(0))
+                }
+                // The references may be only speculative; whoever releases
+                // the last one claims it.
+                State::Present => Some(word.with_state(State::Marked)),
+                State::Exclusive if exclusive => Some(word.with_state(State::ExclusiveMarked)),
+                State::Exclusive => {
+                    absent = true;
+                    None
+                }
             }
+        });
+        match result {
+            Ok(_) => Some(claim),
+            Err(_) if absent => None,
+            Err(_) => Some(false),
         }
     }
 
@@ -358,27 +396,14 @@ impl<T, C: cfg::Config> Slot<T, C> {
     /// Returns `true` if the caller claimed the slot and must now take its
     /// value and free it.
     pub(crate) fn claim(&self, generation: Generation<C>) -> bool {
-        let mut word = self.load(Acquire);
-        loop {
+        let claimed = self.update(|word| {
             test_println!("-> claim {:?}; lifecycle={:?}", generation, word);
-            if word.generation != generation {
-                return false;
-            }
-            match word.state {
-                State::Present => {}
-                // A marked slot is still referenced, and the last reference
-                // would otherwise claim it; claim it first.
-                State::Marked if word.refs > 0 => {}
-                // Not published yet (`refs == 0` means an `InitGuard` holds
-                // the slot), or already claimed.
-                State::Marked | State::Exclusive | State::Vacant => return false,
-            }
-            match self.cas(word, word.claimed(word.refs)) {
-                Ok(()) => break,
-                Err(actual) => word = actual,
-            }
+            let published = matches!(word.state, State::Present | State::Marked);
+            (word.generation == generation && published).then(|| word.claimed(word.refs))
+        });
+        if claimed.is_err() {
+            return false;
         }
-
         // Releasing references no longer claims the slot, since it is now
         // `Vacant`; wait for them to drain.
         let mut spin_exp = 0;
@@ -392,17 +417,17 @@ impl<T, C: cfg::Config> Slot<T, C> {
     /// returning the generation of the new value.
     #[inline]
     pub(super) fn init(&self) -> Generation<C> {
-        let word = self.load(Relaxed);
-        debug_assert!(
-            word.state == State::Vacant && word.refs == 0,
-            "initialized a slot that is not on a free list: {word:?}"
-        );
-        // Nothing else can modify a `Vacant` slot with no references: every
-        // other transition requires a different state. The item itself is
+        // Only speculative `get`s can modify a slot on a free list, and only
+        // its reference count, which must be preserved. The item itself is
         // synchronized by the free list, so no ordering is needed here.
-        self.lifecycle
-            .store(word.with_state(State::Exclusive).pack(), Relaxed);
-        word.generation
+        let delta = State::Vacant as usize ^ State::Exclusive as usize;
+        let prev = Word::<C>::unpack(self.lifecycle.fetch_xor(delta, Relaxed));
+        debug_assert_eq!(
+            prev.state,
+            State::Vacant,
+            "initialized a slot that is not on a free list: {prev:?}"
+        );
+        prev.generation
     }
 
     /// Ends exclusive access, publishing the value with `refs` references.
@@ -412,55 +437,36 @@ impl<T, C: cfg::Config> Slot<T, C> {
     /// happens for `refs > 0`, where the slot stays marked and the last
     /// reference claims it.
     pub(crate) fn publish(&self, generation: Generation<C>, refs: usize) -> bool {
-        let exclusive = Word::<C> {
-            state: State::Exclusive,
-            refs: 0,
-            generation,
-        };
-        let Err(actual) = self.lifecycle.compare_exchange(
-            exclusive.pack(),
-            exclusive.with_state(State::Present).with_refs(refs).pack(),
-            Release,
-            Relaxed,
-        ) else {
-            return false;
-        };
-        let marked = exclusive.with_state(State::Marked);
-        debug_assert_eq!(
-            actual,
-            marked.pack(),
-            "slot changed while exclusively held: {:?}",
-            Word::<C>::unpack(actual)
-        );
-        // `Marked` with no references is a state nothing but us may leave.
-        let (new, claim) = if refs == 0 {
-            (marked.claimed(0), true)
-        } else {
-            (marked.with_refs(refs), false)
-        };
-        self.lifecycle.store(new.pack(), Relaxed);
-        claim
+        let prev = self.update(|word| {
+            debug_assert!(
+                word.generation == generation
+                    && matches!(word.state, State::Exclusive | State::ExclusiveMarked),
+                "slot changed while exclusively held: {word:?}"
+            );
+            let added = word.with_refs(word.refs + refs);
+            Some(match word.state {
+                State::Exclusive => added.with_state(State::Present),
+                // The (speculative) references never access the item, so it
+                // is ours to clear as soon as the slot is claimed.
+                _ if refs == 0 => word.claimed(word.refs),
+                _ => added.with_state(State::Marked),
+            })
+        });
+        let Ok(prev) = prev else { unreachable!() };
+        prev.state == State::ExclusiveMarked && refs == 0
     }
 
     /// Ends exclusive access without publishing the value, claiming the slot.
     /// The caller must now clear and free it.
     pub(crate) fn discard(&self, generation: Generation<C>) {
-        let vacant = Word::<C> {
-            state: State::Vacant,
-            refs: 0,
-            generation: generation.advance(),
-        };
-        let _prev = self.lifecycle.swap(vacant.pack(), Relaxed);
-        debug_assert!(
-            {
-                let prev = Word::<C>::unpack(_prev);
-                prev.generation == generation
-                    && prev.refs == 0
-                    && matches!(prev.state, State::Exclusive | State::Marked)
-            },
-            "slot changed while exclusively held: {:?}",
-            Word::<C>::unpack(_prev)
-        );
+        let _ = self.update(|word| {
+            debug_assert!(
+                word.generation == generation
+                    && matches!(word.state, State::Exclusive | State::ExclusiveMarked),
+                "slot changed while exclusively held: {word:?}"
+            );
+            Some(word.claimed(word.refs))
+        });
     }
 
     /// Clears the item in place.
@@ -476,6 +482,17 @@ impl<T, C: cfg::Config> Slot<T, C> {
         // SAFETY: ensured by the caller.
         unsafe { self.item_mut() }.clear();
     }
+}
+
+/// The outcome of [`Slot::get`].
+pub(crate) enum Get {
+    /// A reference was acquired.
+    Acquired,
+    /// There is no value at the requested generation.
+    Absent,
+    /// There is no value at the requested generation, and undoing the
+    /// speculative reference claimed the slot: the caller must free it.
+    Claimed,
 }
 
 /// Storage for a `Slab` value.
@@ -603,16 +620,20 @@ impl<C> Copy for Generation<C> {}
 // === impl Lifecycle ===
 
 impl<C: cfg::Config> Pack<C> for Lifecycle<C> {
-    const LEN: usize = 2;
+    const LEN: usize = 3;
     type Prev = ();
 
     fn from_usize(u: usize) -> Self {
         Self {
             state: match u & Self::BITS {
-                0b00 => State::Present,
-                0b01 => State::Marked,
-                0b10 => State::Exclusive,
-                _ => State::Vacant,
+                0b000 => State::Present,
+                0b001 => State::Marked,
+                0b010 => State::Exclusive,
+                0b011 => State::ExclusiveMarked,
+                bits => {
+                    debug_assert_eq!(bits, 0b100, "invalid slot state");
+                    State::Vacant
+                }
             },
             _cfg: PhantomData,
         }
@@ -626,7 +647,9 @@ impl<C: cfg::Config> Pack<C> for Lifecycle<C> {
 // === impl RefCount ===
 
 impl<C: cfg::Config> Pack<C> for RefCount<C> {
-    const LEN: usize = cfg::WIDTH - (Lifecycle::<C>::LEN + Generation::<C>::LEN);
+    /// Saturating, so that an invalid `Config` is reported by
+    /// `CfgPrivate::VALIDATE` instead of an overflow here.
+    const LEN: usize = cfg::WIDTH.saturating_sub(Lifecycle::<C>::LEN + Generation::<C>::LEN);
     type Prev = Lifecycle<C>;
 
     fn from_usize(value: usize) -> Self {
@@ -643,17 +666,10 @@ impl<C: cfg::Config> Pack<C> for RefCount<C> {
 }
 
 impl<C: cfg::Config> RefCount<C> {
-    pub(crate) const MAX: usize = Self::BITS.saturating_sub(1);
-
-    #[inline]
-    fn incr(self) -> Option<Self> {
-        if self.value >= Self::MAX {
-            test_println!("-> get: {}; MAX={}", self.value, RefCount::<C>::MAX);
-            return None;
-        }
-
-        Some(Self::from_usize(self.value + 1))
-    }
+    /// Half the field's range: speculative increments may overshoot the
+    /// maximum before being undone, by at most one per concurrently running
+    /// thread, and must never carry into the generation.
+    pub(crate) const MAX: usize = Self::BITS >> 1;
 }
 
 impl<C> fmt::Debug for RefCount<C> {

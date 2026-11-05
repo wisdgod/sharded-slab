@@ -683,3 +683,71 @@ fn clear_races_with_ref_mut_downgrade() {
         assert!(pool.get(key).is_none());
     });
 }
+
+/// A speculative `get` racing with `clear` and the release of the last
+/// reference: the value is cleared exactly once, by whoever claims it.
+#[test]
+fn speculative_get_races_with_last_release() {
+    run_model("speculative_get_races_with_last_release", || {
+        let pool = Arc::new(Pool::<DontDropMe>::new());
+        let (state, value) = DontDropMe::new(1);
+        let key = pool.create_with(|v| *v = value).unwrap();
+        let guard = pool.clone().get_owned(key).unwrap();
+
+        let pool2 = pool.clone();
+        let getter = thread::spawn(move || drop(pool2.get(key)));
+        let pool3 = pool.clone();
+        let clearer = thread::spawn(move || assert!(pool3.clear(key)));
+        drop(guard);
+        getter.join().unwrap();
+        clearer.join().unwrap();
+
+        state.assert_clear();
+        assert!(pool.get(key).is_none());
+    });
+}
+
+/// A speculative `get` on a slot held by a `RefMut` must not let anyone but
+/// the `RefMut` claim it, even if it is cleared meanwhile.
+#[test]
+fn speculative_get_on_ref_mut() {
+    run_model("speculative_get_on_ref_mut", || {
+        let pool = Arc::new(Pool::<DontDropMe>::new());
+        let (state, value) = DontDropMe::new(1);
+        let mut guard = pool.create().unwrap();
+        *guard = value;
+        let key = guard.key();
+
+        let pool2 = pool.clone();
+        let getter = thread::spawn(move || drop(pool2.get(key)));
+        let pool3 = pool.clone();
+        let clearer = thread::spawn(move || assert!(pool3.clear(key)));
+        state.assert_not_clear();
+        drop(guard);
+        getter.join().unwrap();
+        clearer.join().unwrap();
+
+        state.assert_clear();
+        assert!(pool.get(key).is_none());
+    });
+}
+
+/// A `get` with a stale key may speculatively reference a slot on the free
+/// list while the owner reuses it; the new value must be unaffected.
+#[test]
+fn stale_get_races_with_reuse() {
+    run_model("stale_get_races_with_reuse", || {
+        let pool = Arc::new(Pool::<String>::new());
+        let stale = pool.create_with(|s| s.push_str("old")).unwrap();
+        assert!(pool.clear(stale));
+
+        let pool2 = pool.clone();
+        let getter = thread::spawn(move || assert!(pool2.get(stale).is_none()));
+        let key = pool.create_with(|s| s.push_str("new")).unwrap();
+        getter.join().unwrap();
+
+        assert_eq!(*pool.get(key).unwrap(), "new");
+        assert!(pool.clear(key));
+        assert!(pool.get(key).is_none());
+    });
+}
