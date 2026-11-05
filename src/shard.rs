@@ -4,7 +4,7 @@ use crate::{
     clear::Clear,
     page::{
         self, FreeList, Slot,
-        slot::{Get, Value},
+        slot::{Get, Mark, Value},
     },
     sync::{
         alloc,
@@ -200,9 +200,9 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
             return false;
         };
         match slot.mark(C::unpack_gen(key), exclusive) {
-            None => false,
-            Some(false) => true,
-            Some(true) => {
+            Mark::Absent => false,
+            Mark::Marked => true,
+            Mark::Claimed => {
                 // SAFETY: we claimed the slot.
                 unsafe { self.free(key, page_index, slot) };
                 true

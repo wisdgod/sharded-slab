@@ -353,44 +353,27 @@ impl<T, C: cfg::Config> Slot<T, C> {
     ///
     /// An exclusively held value is marked only if `exclusive` is `true`, to
     /// be claimed when exclusive access ends.
-    ///
-    /// Returns `None` if there is no value at `generation`, `Some(true)` if
-    /// the caller claimed the slot and must now clear and free it, or
-    /// `Some(false)` if it will be claimed by whoever releases it last.
-    pub(crate) fn mark(&self, generation: Generation<C>, exclusive: bool) -> Option<bool> {
-        let mut claim = false;
-        let mut absent = false;
-        let result = self.update(|word| {
+    pub(crate) fn mark(&self, generation: Generation<C>, exclusive: bool) -> Mark {
+        let mut word = self.load(Acquire);
+        loop {
             test_println!("-> mark {:?}; lifecycle={:?}", generation, word);
-            (claim, absent) = (false, false);
             if word.generation != generation {
-                absent = true;
-                return None;
+                return Mark::Absent;
             }
-            match word.state {
-                State::Vacant => {
-                    absent = true;
-                    None
-                }
-                State::Marked | State::ExclusiveMarked => None,
-                State::Present if word.refs == 0 => {
-                    claim = true;
-                    Some(word.claimed(0))
-                }
+            let (new, outcome) = match word.state {
+                State::Vacant => return Mark::Absent,
+                State::Exclusive if !exclusive => return Mark::Absent,
+                State::Marked | State::ExclusiveMarked => return Mark::Marked,
+                State::Present if word.refs == 0 => (word.claimed(0), Mark::Claimed),
                 // The references may be only speculative; whoever releases
                 // the last one claims it.
-                State::Present => Some(word.with_state(State::Marked)),
-                State::Exclusive if exclusive => Some(word.with_state(State::ExclusiveMarked)),
-                State::Exclusive => {
-                    absent = true;
-                    None
-                }
+                State::Present => (word.with_state(State::Marked), Mark::Marked),
+                State::Exclusive => (word.with_state(State::ExclusiveMarked), Mark::Marked),
+            };
+            match self.cas(word, new) {
+                Ok(()) => return outcome,
+                Err(actual) => word = actual,
             }
-        });
-        match result {
-            Ok(_) => Some(claim),
-            Err(_) if absent => None,
-            Err(_) => Some(false),
         }
     }
 
@@ -526,6 +509,18 @@ impl<T, C: cfg::Config> Slot<T, C> {
         // SAFETY: ensured by the caller.
         unsafe { self.item_mut() }.clear();
     }
+}
+
+/// The outcome of [`Slot::mark`].
+pub(crate) enum Mark {
+    /// There is no value at the requested generation.
+    Absent,
+    /// The value was marked, and will be claimed by whoever releases it last
+    /// (or by its exclusive guard).
+    Marked,
+    /// The value was unreferenced, so the caller claimed the slot and must
+    /// now clear and free it.
+    Claimed,
 }
 
 /// The outcome of [`Slot::get`].
