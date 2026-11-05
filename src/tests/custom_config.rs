@@ -1,7 +1,7 @@
 //! Ensures that a custom config behaves as the default config, until limits are reached.
 //! Prevents regression after #80.
 
-use crate::{cfg::CfgPrivate, Config, Slab};
+use crate::{Config, Slab, cfg::CfgPrivate};
 
 struct CustomConfig;
 
@@ -75,4 +75,24 @@ fn double_get() {
     }
 
     slab_eq(custom_slab, default_slab);
+}
+
+/// Regression test for hawkw/sharded-slab#83: with reserved bits configured,
+/// removed slots must be reused rather than leaking a fresh slot per insert.
+#[test]
+fn reserved_bits_reuse_slots() {
+    struct ReservedConfig;
+    impl Config for ReservedConfig {
+        const RESERVED_BITS: usize = 1;
+    }
+
+    let slab = Slab::new_with_config::<ReservedConfig>();
+    let first = slab.insert(0).unwrap();
+    assert!(slab.remove(first));
+    let addr = ReservedConfig::unpack_addr(first);
+    for i in 0..1000 {
+        let key = slab.insert(i).unwrap();
+        assert_eq!(ReservedConfig::unpack_addr(key), addr, "slot not reused");
+        assert!(slab.remove(key));
+    }
 }

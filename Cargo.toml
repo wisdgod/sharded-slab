@@ -2,55 +2,47 @@
 name = "sharded-slab"
 version = "0.1.7"
 authors = ["Eliza Weisman <eliza@buoyant.io>"]
-edition = "2018"
+edition = "2024"
+rust-version = "1.99"
 documentation = "https://docs.rs/sharded-slab/"
-homepage = "https://github.com/hawkw/sharded-slab"
 repository = "https://github.com/hawkw/sharded-slab"
 readme = "README.md"
-rust-version = "1.42.0"
 license = "MIT"
 keywords = ["slab", "allocator", "lock-free", "atomic"]
 categories = ["memory-management", "data-structures", "concurrency"]
-description = """
-A lock-free concurrent slab.
-"""
-exclude = [
-    "flake.nix",
-    "flake.lock",
-    ".envrc",
-    ".clog.toml",
-    ".cargo",
-    ".github",
-    ".direnv",
-    "bin",
-]
-
-[badges]
-maintenance = { status = "experimental" }
+description = "A lock-free concurrent slab."
+include = ["/src", "/README.md", "/CHANGELOG.md", "/IMPLEMENTATION.md", "/LICENSE"]
 
 [[bench]]
 name = "bench"
 harness = false
 
-[dependencies]
-lazy_static = "1"
+[features]
+# Use `loom`'s simulated primitives when built with `--cfg loom`, so that
+# downstream `loom` models can include a `Slab` or `Pool`.
+loom = ["dep:loom"]
 
 [dev-dependencies]
 proptest = "1"
-criterion = "0.3"
-slab = "0.4.2"
-memory-stats = "1"
-indexmap = "1" # newer versions lead to "candidate versions found which didn't match" on 1.42.0
+criterion = "0.8"
+slab = "0.4"
+indexmap = "2"
 
 [target.'cfg(loom)'.dependencies]
-loom = { version = "0.5", features = ["checkpoint"], optional = true }
+loom = { version = "0.7", features = ["checkpoint"], optional = true }
 
 [target.'cfg(loom)'.dev-dependencies]
-loom = { version = "0.5", features = ["checkpoint"] }
+loom = { version = "0.7", features = ["checkpoint"] }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(slab_print)'] }
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(slab_print)', 'cfg(docsrs)'] }
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"

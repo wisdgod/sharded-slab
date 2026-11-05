@@ -6,149 +6,89 @@ on:
   pull_request:
 
 env:
-  RUSTFLAGS: -Dwarnings
+  CARGO_BUILD_WARNINGS: deny
+  CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  MSRV: 1.42.0
 
 jobs:
-  build:
-    name: Build (stable, ${{ matrix.target }})
+  test:
+    name: Test (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-unknown-linux-gnu
-          - i686-unknown-linux-musl
+          - i686-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@master
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      - name: cargo build --target ${{ matrix.target }}
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --all-targets --target ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+      - if: matrix.target == 'i686-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - run: cargo test --all-targets --target ${{ matrix.target }}
+      - run: cargo test --doc --target ${{ matrix.target }}
 
-  build-msrv:
-    name: Build (MSRV)
+  loom:
+    name: Loom
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@master
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./bin/loom.sh
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          profile: minimal
-          toolchain: ${{ env.MSRV }}
-          override: true
-      - name: cargo +${{ env.MSRV }} build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
+          components: miri
+      - run: cargo miri test --lib --tests
         env:
-          RUSTFLAGS: "" # remove -Dwarnings
-
-  build-nightly:
-    name: Build (nightly)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
-      - name: cargo +nightly build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-        env:
-          RUSTFLAGS: "" # remove -Dwarnings
-
-  test:
-    name: Tests (stable)
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - name: Run tests
-        run: cargo test
-
-  test-loom:
-    name: Loom tests (stable)
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - name: Run Loom tests
-        run: ./bin/loom.sh
+          MIRIFLAGS: -Zmiri-many-seeds=0..8
+          PROPTEST_CASES: "8"
 
   clippy:
-    name: Clippy (stable)
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
           components: clippy
-          override: true
-      - name: cargo clippy --all-targets --all-features
-        uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-targets --all-features
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --lib --tests
+        env:
+          RUSTFLAGS: --cfg loom
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -Dwarnings
 
   rustfmt:
-    name: Rustfmt (stable)
+    name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
           components: rustfmt
-          override: true
-      - name: Run rustfmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: -- --check
+      - run: cargo fmt --all --check
 
   all-systems-go:
     name: "all systems go!"
-    needs:
-      - build
-      - build-msrv
-      # Note: we explicitly *don't* require the `build-nightly` job to pass,
-      # since the nightly Rust compiler is unstable. We don't want nightly
-      # regressions to break our build --- this CI job is intended for
-      # informational reasons rather than as a gatekeeper for merging PRs.
-      - test
-      - test-loom
-      - clippy
-      - rustfmt
+    if: always()
+    needs: [test, loom, miri, clippy, docs, rustfmt]
     runs-on: ubuntu-latest
     steps:
-      - run: exit 0
+      - run: exit 1
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

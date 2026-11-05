@@ -1,4 +1,5 @@
 use crate::{
+    Pack,
     cfg::{self, CfgPrivate},
     clear::Clear,
     page,
@@ -10,7 +11,6 @@ use crate::{
         },
     },
     tid::Tid,
-    Pack,
 };
 
 use std::{fmt, ptr, slice};

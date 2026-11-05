@@ -14,7 +14,7 @@ use std::{ops::Range, sync::Arc};
 use indexmap::IndexMap;
 use proptest::prelude::*;
 
-use crate::{tid, Config, DefaultConfig, Slab};
+use crate::{Config, DefaultConfig, Slab, tid};
 
 const THREADS: Range<usize> = 1..4;
 const ACTIONS: Range<usize> = 1..1000;

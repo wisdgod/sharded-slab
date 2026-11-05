@@ -1,9 +1,9 @@
 use super::util::*;
-use crate::{clear::Clear, sync::alloc, Pack, Pool};
+use crate::{Pack, Pool, clear::Clear, sync::alloc};
 use loom::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
 };
@@ -183,7 +183,7 @@ fn clear_local_and_reuse() {
         assert!(pool.clear(idx1));
 
         let idx1 = pool
-            .create_with(move |item| item.push_str("h"))
+            .create_with(move |item| item.push('h'))
             .expect("create_with");
 
         let second = idx1 & (!crate::page::slot::Generation::<TinyConfig>::MASK);

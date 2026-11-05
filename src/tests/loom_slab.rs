@@ -1,11 +1,11 @@
 use super::util::*;
-use crate::sync::alloc;
 use crate::Slab;
+use crate::sync::alloc;
 use loom::sync::{Condvar, Mutex};
 use loom::thread;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 #[test]
@@ -399,7 +399,7 @@ fn unique_iter() {
         t2.join().expect("thread 2 should not panic");
 
         let slab = Arc::get_mut(&mut slab).expect("other arcs should be dropped");
-        let items: Vec<_> = slab.unique_iter().map(|&i| i).collect();
+        let items: Vec<_> = slab.unique_iter().copied().collect();
         assert!(items.contains(&1), "items: {:?}", items);
         assert!(items.contains(&2), "items: {:?}", items);
         assert!(items.contains(&3), "items: {:?}", items);

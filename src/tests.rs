@@ -1,8 +1,7 @@
 mod idx {
     use crate::{
-        cfg,
+        Pack, Tid, cfg,
         page::{self, slot},
-        Pack, Tid,
     };
     use proptest::prelude::*;
 
@@ -19,15 +18,15 @@ mod idx {
         #[cfg_attr(loom, ignore)]
         fn idx_roundtrips(
             tid in 0usize..Tid::<cfg::DefaultConfig>::BITS,
-            gen in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS,
+            generation in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS,
             addr in 0usize..page::Addr::<cfg::DefaultConfig>::BITS,
         ) {
             let tid = Tid::<cfg::DefaultConfig>::from_usize(tid);
-            let gen = slot::Generation::<cfg::DefaultConfig>::from_usize(gen);
+            let generation = slot::Generation::<cfg::DefaultConfig>::from_usize(generation);
             let addr = page::Addr::<cfg::DefaultConfig>::from_usize(addr);
-            let packed = tid.pack(gen.pack(addr.pack(0)));
+            let packed = tid.pack(generation.pack(addr.pack(0)));
             assert_eq!(addr, page::Addr::from_packed(packed));
-            assert_eq!(gen, slot::Generation::from_packed(packed));
+            assert_eq!(generation, slot::Generation::from_packed(packed));
             assert_eq!(tid, Tid::from_packed(packed));
         }
     }

@@ -1,4 +1,5 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+//! Benchmarks comparing `sharded_slab::Slab` against lock-wrapped `slab::Slab`.
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::{
     sync::{Arc, Barrier, RwLock},
     thread,

@@ -1,8 +1,8 @@
-use crate::page::{
-    slot::{Generation, RefCount},
-    Addr,
-};
 use crate::Pack;
+use crate::page::{
+    Addr,
+    slot::{Generation, RefCount},
+};
 use std::{fmt, marker::PhantomData};
 /// Configuration parameters which can be overridden to tune the behavior of a slab.
 pub trait Config: Sized {
@@ -168,11 +168,11 @@ impl<C: Config> fmt::Debug for DebugConfig<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Slab;
+    use crate::Tid;
     use crate::page::slot::Lifecycle;
     use crate::page::slot::LifecycleGen;
     use crate::test_util;
-    use crate::Slab;
-    use crate::Tid;
 
     #[cfg(target_pointer_width = "32")]
     #[test]

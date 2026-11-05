@@ -198,9 +198,6 @@
 //! See [this page](crate::implementation) for details on this crate's design
 //! and implementation.
 //!
-#![doc(html_root_url = "https://docs.rs/sharded-slab/0.1.4")]
-#![warn(missing_debug_implementations, missing_docs)]
-#![cfg_attr(docsrs, warn(rustdoc::broken_intra_doc_links))]
 #[macro_use]
 mod macros;
 
@@ -424,8 +421,8 @@ impl<T, C: cfg::Config> Slab<T, C> {
         let mut value = Some(value);
         shard
             .init_with(|idx, slot| {
-                let gen = slot.insert(&mut value)?;
-                Some(gen.pack(idx))
+                let generation = slot.insert(&mut value)?;
+                Some(generation.pack(idx))
             })
             .map(|idx| tid.pack(idx))
     }
@@ -981,7 +978,10 @@ where
                 shard.clear_after_release(self.key)
             } else {
                 test_println!("-> shard={:?} does not exist! THIS IS A BUG", shard_idx);
-                debug_assert!(std::thread::panicking(), "[internal error] tried to drop an `OwnedEntry` to a slot on a shard that never existed!");
+                debug_assert!(
+                    std::thread::panicking(),
+                    "[internal error] tried to drop an `OwnedEntry` to a slot on a shard that never existed!"
+                );
             }
         }
     }

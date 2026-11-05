@@ -77,6 +77,10 @@ mod test {
     use std::sync::Arc;
 
     #[test]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "loom threads are simulated and do not require `Send`"
+    )]
     fn transfer_stack() {
         test_util::run_model("transfer_stack", || {
             let causalities = [UnsafeCell::new(999), UnsafeCell::new(999)];
@@ -105,7 +109,7 @@ mod test {
 
             let (causalities, stack) = &*shared;
             let mut idx = stack.pop_all();
-            while idx == None {
+            while idx.is_none() {
                 idx = stack.pop_all();
                 thread::yield_now();
             }

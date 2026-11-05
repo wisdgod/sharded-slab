@@ -1,7 +1,7 @@
+use crate::Pack;
 use crate::cfg::{self, CfgPrivate};
 use crate::clear::Clear;
 use crate::sync::UnsafeCell;
-use crate::Pack;
 
 pub(crate) mod slot;
 mod stack;
@@ -191,7 +191,7 @@ where
     }
 
     #[inline(always)]
-    pub(crate) fn free_list(&self) -> &impl FreeList<C> {
+    pub(crate) fn free_list(&self) -> &(impl FreeList<C> + use<T, C>) {
         &self.remote
     }
 }
@@ -203,7 +203,7 @@ where
     pub(crate) fn take<F>(
         &self,
         addr: Addr<C>,
-        gen: slot::Generation<C>,
+        generation: slot::Generation<C>,
         free_list: &F,
     ) -> Option<T>
     where
@@ -216,14 +216,14 @@ where
         self.slab.with(|slab| {
             let slab = unsafe { &*slab }.as_ref()?;
             let slot = slab.get(offset)?;
-            slot.remove_value(gen, offset, free_list)
+            slot.remove_value(generation, offset, free_list)
         })
     }
 
     pub(crate) fn remove<F: FreeList<C>>(
         &self,
         addr: Addr<C>,
-        gen: slot::Generation<C>,
+        generation: slot::Generation<C>,
         free_list: &F,
     ) -> bool {
         let offset = addr.offset() - self.prev_sz;
@@ -233,7 +233,7 @@ where
         self.slab.with(|slab| {
             let slab = unsafe { &*slab }.as_ref();
             if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.try_remove_value(gen, offset, free_list)
+                slot.try_remove_value(generation, offset, free_list)
             } else {
                 false
             }
@@ -310,7 +310,7 @@ where
     pub(crate) fn mark_clear<F: FreeList<C>>(
         &self,
         addr: Addr<C>,
-        gen: slot::Generation<C>,
+        generation: slot::Generation<C>,
         free_list: &F,
     ) -> bool {
         let offset = addr.offset() - self.prev_sz;
@@ -320,7 +320,7 @@ where
         self.slab.with(|slab| {
             let slab = unsafe { &*slab }.as_ref();
             if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.try_clear_storage(gen, offset, free_list)
+                slot.try_clear_storage(generation, offset, free_list)
             } else {
                 false
             }
@@ -330,7 +330,7 @@ where
     pub(crate) fn clear<F: FreeList<C>>(
         &self,
         addr: Addr<C>,
-        gen: slot::Generation<C>,
+        generation: slot::Generation<C>,
         free_list: &F,
     ) -> bool {
         let offset = addr.offset() - self.prev_sz;
@@ -340,7 +340,7 @@ where
         self.slab.with(|slab| {
             let slab = unsafe { &*slab }.as_ref();
             if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.clear_storage(gen, offset, free_list)
+                slot.clear_storage(generation, offset, free_list)
             } else {
                 false
             }
@@ -428,22 +428,22 @@ mod test {
             assert_eq!(addr, Addr::from_packed(packed));
         }
         #[test]
-        fn gen_roundtrips(gen in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS) {
-            let gen = slot::Generation::<cfg::DefaultConfig>::from_usize(gen);
-            let packed = gen.pack(0);
-            assert_eq!(gen, slot::Generation::from_packed(packed));
+        fn gen_roundtrips(generation in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS) {
+            let generation = slot::Generation::<cfg::DefaultConfig>::from_usize(generation);
+            let packed = generation.pack(0);
+            assert_eq!(generation, slot::Generation::from_packed(packed));
         }
 
         #[test]
         fn page_roundtrips(
-            gen in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS,
+            generation in 0usize..slot::Generation::<cfg::DefaultConfig>::BITS,
             addr in 0usize..Addr::<cfg::DefaultConfig>::BITS,
         ) {
-            let gen = slot::Generation::<cfg::DefaultConfig>::from_usize(gen);
+            let generation = slot::Generation::<cfg::DefaultConfig>::from_usize(generation);
             let addr = Addr::<cfg::DefaultConfig>::from_usize(addr);
-            let packed = gen.pack(addr.pack(0));
+            let packed = generation.pack(addr.pack(0));
             assert_eq!(addr, Addr::from_packed(packed));
-            assert_eq!(gen, slot::Generation::from_packed(packed));
+            assert_eq!(generation, slot::Generation::from_packed(packed));
         }
     }
 }

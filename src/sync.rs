@@ -1,3 +1,6 @@
+//! Synchronization primitives, swapped for `loom`'s simulated versions when
+//! running under `--cfg loom`.
+
 pub(crate) use self::inner::*;
 
 #[cfg(all(loom, any(test, feature = "loom")))]
@@ -60,80 +63,64 @@ mod inner {
     }
 }
 
-#[cfg(not(all(loom, any(feature = "loom", test))))]
+#[cfg(not(all(loom, any(test, feature = "loom"))))]
 mod inner {
-    #![allow(dead_code)]
-    pub(crate) use lazy_static::lazy_static;
     pub(crate) use std::{
-        sync::{atomic, Mutex},
+        hint,
+        sync::{Mutex, atomic},
         thread::yield_now,
         thread_local,
     };
 
-    pub(crate) mod hint {
-        #[inline(always)]
-        pub(crate) fn spin_loop() {
-            // MSRV: std::hint::spin_loop() stabilized in 1.49.0
-            #[allow(deprecated)]
-            super::atomic::spin_loop_hint()
-        }
-    }
-
+    /// `std::cell::UnsafeCell` with `loom`'s closure-based access API.
     #[derive(Debug)]
+    #[repr(transparent)]
     pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
     impl<T> UnsafeCell<T> {
-        pub fn new(data: T) -> UnsafeCell<T> {
+        #[inline(always)]
+        pub(crate) const fn new(data: T) -> UnsafeCell<T> {
             UnsafeCell(std::cell::UnsafeCell::new(data))
         }
 
         #[inline(always)]
-        pub fn with<F, R>(&self, f: F) -> R
-        where
-            F: FnOnce(*const T) -> R,
-        {
+        pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
             f(self.0.get())
         }
 
         #[inline(always)]
-        pub fn with_mut<F, R>(&self, f: F) -> R
-        where
-            F: FnOnce(*mut T) -> R,
-        {
+        pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
             f(self.0.get())
         }
     }
 
     pub(crate) mod alloc {
-        /// Track allocations, detecting leaks
+        /// Track allocations, detecting leaks. A no-op outside of `loom`.
         #[derive(Debug, Default)]
-        pub struct Track<T> {
-            value: T,
-        }
+        #[repr(transparent)]
+        pub(crate) struct Track<T>(T);
 
         impl<T> Track<T> {
-            /// Track a value for leaks
             #[inline(always)]
-            pub fn new(value: T) -> Track<T> {
-                Track { value }
+            pub(crate) const fn new(value: T) -> Track<T> {
+                Track(value)
             }
 
-            /// Get a reference to the value
             #[inline(always)]
-            pub fn get_ref(&self) -> &T {
-                &self.value
+            pub(crate) const fn get_ref(&self) -> &T {
+                &self.0
             }
 
-            /// Get a mutable reference to the value
             #[inline(always)]
-            pub fn get_mut(&mut self) -> &mut T {
-                &mut self.value
+            #[allow(dead_code)]
+            pub(crate) const fn get_mut(&mut self) -> &mut T {
+                &mut self.0
             }
 
-            /// Stop tracking the value for leaks
             #[inline(always)]
-            pub fn into_inner(self) -> T {
-                self.value
+            #[allow(dead_code)]
+            pub(crate) fn into_inner(self) -> T {
+                self.0
             }
         }
     }

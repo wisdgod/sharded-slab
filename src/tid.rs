@@ -1,11 +1,12 @@
 use crate::{
+    Pack,
     cfg::{self, CfgPrivate},
     page,
     sync::{
+        Mutex,
         atomic::{AtomicUsize, Ordering},
-        lazy_static, thread_local, Mutex,
+        thread_local,
     },
-    Pack,
 };
 use std::{
     cell::{Cell, UnsafeCell},
@@ -29,7 +30,14 @@ struct Registry {
     free: Mutex<VecDeque<usize>>,
 }
 
-lazy_static! {
+#[cfg(not(all(loom, any(test, feature = "loom"))))]
+static REGISTRY: Registry = Registry {
+    next: AtomicUsize::new(0),
+    free: Mutex::new(VecDeque::new()),
+};
+
+#[cfg(all(loom, any(test, feature = "loom")))]
+crate::sync::lazy_static! {
     static ref REGISTRY: Registry = Registry {
         next: AtomicUsize::new(0),
         free: Mutex::new(VecDeque::new()),
@@ -86,7 +94,7 @@ impl<C> Tid<C> {
     #[cold]
     fn poisoned() -> Self {
         Self {
-            id: std::usize::MAX,
+            id: usize::MAX,
             _not_send: PhantomData,
             _cfg: PhantomData,
         }
@@ -94,7 +102,7 @@ impl<C> Tid<C> {
 
     /// Returns true if the local thread ID was accessed while unwinding.
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.id == std::usize::MAX
+        self.id == usize::MAX
     }
 }
 
