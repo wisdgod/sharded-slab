@@ -72,3 +72,5 @@ mod loom_pool;
 mod loom_slab;
 #[cfg(not(loom))]
 mod properties;
+#[cfg(not(loom))]
+mod threads;

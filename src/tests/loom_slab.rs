@@ -758,3 +758,22 @@ fn owned_entry_drop_from_other_threads() {
         assert!(slab.get(key2).is_none());
     });
 }
+
+/// Regression test for the unsynchronized lazy page allocation reported in
+/// hawkw/sharded-slab#116: a remote lookup must not race with the owning
+/// thread allocating the page.
+#[test]
+fn get_races_with_page_allocation() {
+    run_model("get_races_with_page_allocation", || {
+        let slab: Arc<Slab<bool>> = Arc::new(Slab::new());
+        let owner = slab.clone();
+        let t = thread::spawn(move || {
+            owner.insert(true);
+        });
+        thread::yield_now();
+        // Index 0 decodes to thread 0 (the spawned thread above, which is the
+        // first to register under loom), page 0.
+        let _ = slab.get(0);
+        t.join().unwrap();
+    });
+}

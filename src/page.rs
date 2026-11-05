@@ -1,12 +1,15 @@
 use crate::Pack;
 use crate::cfg::{self, CfgPrivate};
 use crate::clear::Clear;
-use crate::sync::UnsafeCell;
+use crate::sync::{
+    UnsafeCell,
+    atomic::{AtomicPtr, Ordering},
+};
 
 pub(crate) mod slot;
 mod stack;
 pub(crate) use self::slot::Slot;
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, ptr};
 
 /// A page address encodes the location of a slot within a shard (the page
 /// number and offset within that page) as a single linear value.
@@ -85,10 +88,14 @@ pub(crate) struct Shared<T, C> {
     // then there are no slots left in that page.
     size: usize,
     prev_sz: usize,
-    slab: UnsafeCell<Option<Slots<T, C>>>,
+    /// Pointer to the page's `size` slots, or null if the page has not been
+    /// allocated yet.
+    ///
+    /// The page is allocated lazily by the shard's owning thread, while any
+    /// thread may look up a slot on it, so publishing the allocation must be
+    /// a `Release` store paired with `Acquire` loads.
+    slots: AtomicPtr<Slot<T, C>>,
 }
-
-type Slots<T, C> = Box<[Slot<T, C>]>;
 
 impl Local {
     pub(crate) fn new() -> Self {
@@ -128,8 +135,26 @@ where
             prev_sz,
             size,
             remote: stack::TransferStack::new(),
-            slab: UnsafeCell::new(None),
+            slots: AtomicPtr::new(ptr::null_mut()),
         }
+    }
+
+    /// Returns the page's slots, or `None` if the page is not allocated.
+    #[inline(always)]
+    fn slots(&self) -> Option<&[Slot<T, C>]> {
+        let ptr = self.slots.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null pointer was published by `allocate` with a
+        // `Release` store after the `size` slots were initialized, and the
+        // allocation lives until `self` is dropped.
+        Some(unsafe { &*ptr::slice_from_raw_parts(ptr, self.size) })
+    }
+
+    #[inline(always)]
+    fn slot(&self, offset: usize) -> Option<&Slot<T, C>> {
+        self.slots()?.get(offset)
     }
 
     /// Return the head of the freelist
@@ -171,7 +196,7 @@ where
     /// otherwise.
     #[inline]
     fn is_unallocated(&self) -> bool {
-        self.slab.with(|s| unsafe { (*s).is_none() })
+        self.slots.load(Ordering::Relaxed).is_null()
     }
 
     #[inline]
@@ -184,10 +209,7 @@ where
 
         test_println!("-> offset {:?}", poff);
 
-        self.slab.with(|slab| {
-            let slot = unsafe { &*slab }.as_ref()?.get(poff)?;
-            f(slot)
-        })
+        f(self.slot(poff)?)
     }
 
     #[inline(always)]
@@ -213,11 +235,8 @@ where
 
         test_println!("-> take: offset {:?}", offset);
 
-        self.slab.with(|slab| {
-            let slab = unsafe { &*slab }.as_ref()?;
-            let slot = slab.get(offset)?;
-            slot.remove_value(generation, offset, free_list)
-        })
+        self.slot(offset)?
+            .remove_value(generation, offset, free_list)
     }
 
     pub(crate) fn remove<F: FreeList<C>>(
@@ -230,14 +249,8 @@ where
 
         test_println!("-> offset {:?}", offset);
 
-        self.slab.with(|slab| {
-            let slab = unsafe { &*slab }.as_ref();
-            if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.try_remove_value(generation, offset, free_list)
-            } else {
-                false
-            }
-        })
+        self.slot(offset)
+            .is_some_and(|slot| slot.try_remove_value(generation, offset, free_list))
     }
 
     // Need this function separately, as we need to pass a function pointer to `filter_map` and
@@ -246,12 +259,13 @@ where
         slot.value().as_ref()
     }
 
-    pub(crate) fn iter(&self) -> Option<Iter<'a, T, C>> {
-        let slab = self.slab.with(|slab| unsafe { (*slab).as_ref() });
-        slab.map(|slab| {
-            slab.iter()
-                .filter_map(Shared::make_ref as fn(&'a Slot<Option<T>, C>) -> Option<&'a T>)
-        })
+    pub(crate) fn iter(&'a self) -> Option<Iter<'a, T, C>> {
+        let slots = self.slots()?;
+        Some(
+            slots
+                .iter()
+                .filter_map(Shared::make_ref as fn(&'a Slot<Option<T>, C>) -> Option<&'a T>),
+        )
     }
 }
 
@@ -274,15 +288,11 @@ where
 
         let index = head + self.prev_sz;
 
-        let result = self.slab.with(|slab| {
-            let slab = unsafe { &*(slab) }
-                .as_ref()
-                .expect("page must have been allocated to insert!");
-            let slot = &slab[head];
-            let result = init(index, slot)?;
-            local.set_head(slot.next());
-            Some(result)
-        })?;
+        let slot = &self
+            .slots()
+            .expect("page must have been allocated to insert!")[head];
+        let result = init(index, slot)?;
+        local.set_head(slot.next());
 
         test_println!("-> init_with: insert at offset: {}", index);
         Some(result)
@@ -294,17 +304,12 @@ where
         test_println!("-> alloc new page ({})", self.size);
         debug_assert!(self.is_unallocated());
 
-        let mut slab = Vec::with_capacity(self.size);
-        slab.extend((1..self.size).map(Slot::new));
-        slab.push(Slot::new(Self::NULL));
-        self.slab.with_mut(|s| {
-            // safety: this mut access is safe — it only occurs to initially allocate the page,
-            // which only happens on this thread; if the page has not yet been allocated, other
-            // threads will not try to access it yet.
-            unsafe {
-                *s = Some(slab.into_boxed_slice());
-            }
-        });
+        let slots: Box<[Slot<T, C>]> = (1..self.size).chain([Self::NULL]).map(Slot::new).collect();
+        debug_assert_eq!(slots.len(), self.size);
+        // Only the owning thread allocates, so a plain `Release` store (rather
+        // than a CAS) suffices to publish the initialized slots.
+        self.slots
+            .store(Box::into_raw(slots).cast::<Slot<T, C>>(), Ordering::Release);
     }
 
     pub(crate) fn mark_clear<F: FreeList<C>>(
@@ -317,14 +322,8 @@ where
 
         test_println!("-> offset {:?}", offset);
 
-        self.slab.with(|slab| {
-            let slab = unsafe { &*slab }.as_ref();
-            if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.try_clear_storage(generation, offset, free_list)
-            } else {
-                false
-            }
-        })
+        self.slot(offset)
+            .is_some_and(|slot| slot.try_clear_storage(generation, offset, free_list))
     }
 
     pub(crate) fn clear<F: FreeList<C>>(
@@ -337,14 +336,8 @@ where
 
         test_println!("-> offset {:?}", offset);
 
-        self.slab.with(|slab| {
-            let slab = unsafe { &*slab }.as_ref();
-            if let Some(slot) = slab.and_then(|slab| slab.get(offset)) {
-                slot.clear_storage(generation, offset, free_list)
-            } else {
-                false
-            }
-        })
+        self.slot(offset)
+            .is_some_and(|slot| slot.clear_storage(generation, offset, free_list))
     }
 }
 
@@ -356,6 +349,20 @@ impl fmt::Debug for Local {
                 .field("head", &format_args!("{:#0x}", head))
                 .finish()
         })
+    }
+}
+
+impl<T, C> Drop for Shared<T, C> {
+    fn drop(&mut self) {
+        // `&mut self` already guarantees exclusive access, and loom atomics have no
+        // `get_mut`, so a relaxed load is used.
+        let ptr = self.slots.load(Ordering::Relaxed);
+        if !ptr.is_null() {
+            // SAFETY: `ptr` came from `Box::<[Slot<T, C>]>::into_raw` of a
+            // slice of length `self.size` in `allocate`, and is freed only
+            // here, when the page is dropped.
+            drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, self.size)) });
+        }
     }
 }
 
