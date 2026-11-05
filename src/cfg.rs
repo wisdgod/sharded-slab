@@ -12,6 +12,12 @@ pub trait Config: Sized {
     /// in the slab. If a thread is created, accesses the slab, and then terminates,
     /// its shard may be reused and thus does not count against the maximum
     /// number of threads once the thread has terminated.
+    ///
+    /// Thread IDs are shared by all slabs and pools. A thread whose ID exceeds
+    /// this limit (because more threads are concurrently using any slab or
+    /// pool) cannot insert into a slab or pool using this `Config`: `insert`,
+    /// `vacant_entry`, and `create` return `None`. It can still access and
+    /// remove existing values.
     const MAX_THREADS: usize = DefaultConfig::MAX_THREADS;
     /// The maximum number of pages in each shard in the slab.
     ///

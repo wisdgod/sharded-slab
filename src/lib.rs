@@ -404,9 +404,10 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// Inserts a value into the slab, returning the integer index at which that
     /// value was inserted. This index can then be used to access the entry.
     ///
-    /// If this function returns `None`, then the shard for the current thread
-    /// is full and no items can be added until some are removed, or the maximum
-    /// number of shards has been reached.
+    /// If this function returns `None`, then the shard for the current thread is
+    /// full and no items can be added until some are removed, or the calling thread
+    /// cannot be assigned a shard: more than [`Config::MAX_THREADS`] threads are
+    /// concurrently using slabs or pools, or the thread is exiting.
     ///
     /// # Examples
     /// ```rust
@@ -429,6 +430,8 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// slab index. The returned [`VacantEntry`] reserves a slot in the slab and
     /// is able to return the index of the entry.
     ///
+    /// Returns `None` in the same cases as [`insert`](Slab::insert).
+    ///
     /// # Examples
     ///
     /// ```
@@ -447,7 +450,7 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert_eq!("hello", slab.get(hello).unwrap().1);
     /// ```
     pub fn vacant_entry(&self) -> Option<VacantEntry<'_, T, C>> {
-        let (tid, shard) = self.shards.current();
+        let (tid, shard) = self.shards.current()?;
         test_println!("vacant_entry {:?}", tid);
         Some(VacantEntry {
             inner: shard.init()?,

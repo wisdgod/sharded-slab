@@ -399,39 +399,33 @@ where
         self.shards.get(idx)?.load(Acquire)
     }
 
+    /// Returns the calling thread's shard, allocating it if needed.
+    ///
+    /// Returns `None` if the thread cannot have a shard: its ID exceeds the
+    /// configured maximum number of threads, or it is exiting.
     #[inline]
-    pub(crate) fn current(&self) -> (Tid<C>, &Shard<T, C>) {
-        let tid = Tid::<C>::current();
+    pub(crate) fn current(&self) -> Option<(Tid<C>, &Shard<T, C>)> {
+        let tid = Tid::<C>::current()?;
         test_println!("current: {:?}", tid);
         let idx = tid.as_usize();
-        assert!(
-            idx < self.shards.len(),
-            "Thread count overflowed the configured max count. \
-            Thread index = {}, max threads = {}.",
-            idx,
-            C::MAX_SHARDS,
-        );
+        let ptr = self.shards.get(idx)?;
         // It's okay for this to be relaxed. The value is only ever stored by
         // the thread that corresponds to the index, and we are that thread.
-        let shard = self.shards[idx].load(Relaxed).unwrap_or_else(|| {
-            let ptr = Box::into_raw(Box::new(alloc::Track::new(Shard::new(idx))));
-            test_println!("-> allocated new shard for index {} at {:p}", idx, ptr);
-            self.shards[idx].set(ptr);
-            let mut max = self.max.load(Acquire);
-            while max < idx {
-                match self.max.compare_exchange(max, idx, AcqRel, Acquire) {
-                    Ok(_) => break,
-                    Err(actual) => max = actual,
-                }
-            }
-            test_println!("-> highest index={}, prev={}", std::cmp::max(max, idx), max);
-            unsafe {
-                // Safety: we just put it there!
-                &*ptr
-            }
-            .get_ref()
-        });
-        (tid, shard)
+        let shard = match ptr.load(Relaxed) {
+            Some(shard) => shard,
+            None => self.allocate(idx),
+        };
+        Some((tid, shard))
+    }
+
+    #[cold]
+    fn allocate(&self, idx: usize) -> &Shard<T, C> {
+        let ptr = Box::into_raw(Box::new(alloc::Track::new(Shard::new(idx))));
+        test_println!("-> allocated new shard for index {} at {:p}", idx, ptr);
+        self.shards[idx].set(ptr);
+        self.max.fetch_max(idx, AcqRel);
+        // SAFETY: we just published it, and it lives as long as `self`.
+        unsafe { &*ptr }.get_ref()
     }
 
     pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T, C> {
