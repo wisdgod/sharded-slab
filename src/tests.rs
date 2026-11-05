@@ -66,6 +66,8 @@ pub(crate) mod util {
 
 #[cfg(not(loom))]
 mod custom_config;
+#[cfg(not(loom))]
+mod lifecycle;
 #[cfg(loom)]
 mod loom_pool;
 #[cfg(loom)]

@@ -78,14 +78,18 @@ impl<C: cfg::Config> Tid<C> {
             .unwrap_or_else(|_| Self::poisoned())
     }
 
+    /// Returns `true` if this is the calling thread's ID.
+    ///
+    /// Unlike [`Tid::current`], this never registers the calling thread.
+    #[inline]
     pub(crate) fn is_current(self) -> bool {
         REGISTRATION
-            .try_with(|r| self == r.current::<C>())
+            .try_with(|r| r.0.get() == Some(self.id))
             .unwrap_or(false)
     }
 
     #[inline(always)]
-    pub fn new(id: usize) -> Self {
+    pub(crate) fn new(id: usize) -> Self {
         Self::from_usize(id)
     }
 }

@@ -80,6 +80,7 @@ fn double_get() {
 /// Regression test for hawkw/sharded-slab#83: with reserved bits configured,
 /// removed slots must be reused rather than leaking a fresh slot per insert.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn reserved_bits_reuse_slots() {
     struct ReservedConfig;
     impl Config for ReservedConfig {

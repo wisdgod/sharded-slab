@@ -224,8 +224,9 @@ pub use pool::Pool;
 pub(crate) use tid::Tid;
 
 use cfg::{CfgPrivate, WIDTH};
-use shard::Shard;
-use std::{fmt, marker::PhantomData, ptr, sync::Arc};
+use std::{fmt, marker::PhantomData, ops::Deref, ptr::NonNull, sync::Arc};
+
+type SlabGuard<T, C> = shard::Guard<Option<T>, C>;
 
 /// A sharded slab.
 ///
@@ -242,10 +243,9 @@ pub struct Slab<T, C: cfg::Config = DefaultConfig> {
 /// while a guard exists, the removal will be deferred until all guards are
 /// dropped.
 pub struct Entry<'a, T, C: cfg::Config = DefaultConfig> {
-    inner: page::slot::Guard<Option<T>, C>,
-    value: ptr::NonNull<T>,
-    shard: &'a Shard<Option<T>, C>,
-    key: usize,
+    inner: SlabGuard<T, C>,
+    value: NonNull<T>,
+    _slab: PhantomData<&'a Slab<T, C>>,
 }
 
 /// A handle to a vacant entry in a [`Slab`].
@@ -272,9 +272,8 @@ pub struct Entry<'a, T, C: cfg::Config = DefaultConfig> {
 /// ```
 #[derive(Debug)]
 pub struct VacantEntry<'a, T, C: cfg::Config = DefaultConfig> {
-    inner: page::slot::InitGuard<Option<T>, C>,
-    key: usize,
-    _lt: PhantomData<&'a ()>,
+    inner: shard::InitGuard<Option<T>, C>,
+    _slab: PhantomData<&'a Slab<T, C>>,
 }
 
 /// An owned reference to an occupied entry in a [`Slab`].
@@ -364,10 +363,10 @@ pub struct OwnedEntry<T, C = DefaultConfig>
 where
     C: cfg::Config,
 {
-    inner: page::slot::Guard<Option<T>, C>,
-    value: ptr::NonNull<T>,
-    slab: Arc<Slab<T, C>>,
-    key: usize,
+    // Declared before `_slab`, so that the guard is dropped first.
+    inner: SlabGuard<T, C>,
+    value: NonNull<T>,
+    _slab: Arc<Slab<T, C>>,
 }
 
 impl<T> Slab<T> {
@@ -416,15 +415,10 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert_eq!(slab.get(key).unwrap(), "hello world");
     /// ```
     pub fn insert(&self, value: T) -> Option<usize> {
-        let (tid, shard) = self.shards.current();
-        test_println!("insert {:?}", tid);
-        let mut value = Some(value);
-        shard
-            .init_with(|idx, slot| {
-                let generation = slot.insert(&mut value)?;
-                Some(generation.pack(idx))
-            })
-            .map(|idx| tid.pack(idx))
+        let entry = self.vacant_entry()?;
+        let key = entry.key();
+        entry.insert(value);
+        Some(key)
     }
 
     /// Return a handle to a vacant entry allowing for further manipulation.
@@ -453,14 +447,9 @@ impl<T, C: cfg::Config> Slab<T, C> {
     pub fn vacant_entry(&self) -> Option<VacantEntry<'_, T, C>> {
         let (tid, shard) = self.shards.current();
         test_println!("vacant_entry {:?}", tid);
-        shard.init_with(|idx, slot| {
-            let inner = slot.init()?;
-            let key = inner.generation().pack(tid.pack(idx));
-            Some(VacantEntry {
-                inner,
-                key,
-                _lt: PhantomData,
-            })
+        Some(VacantEntry {
+            inner: shard.init()?,
+            _slab: PhantomData,
         })
     }
 
@@ -508,18 +497,13 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// ```
     /// [`take`]: Slab::take
     pub fn remove(&self, idx: usize) -> bool {
-        // The `Drop` impl for `Entry` calls `remove_local` or `remove_remote` based
-        // on where the guard was dropped from. If the dropped guard was the last one, this will
-        // call `Slot::remove_value` which actually clears storage.
-        let tid = C::unpack_tid(idx);
-
-        test_println!("rm_deferred {:?}", tid);
-        let shard = self.shards.get(tid.as_usize());
-        if tid.is_current() {
-            shard.map(|shard| shard.remove_local(idx)).unwrap_or(false)
-        } else {
-            shard.map(|shard| shard.remove_remote(idx)).unwrap_or(false)
-        }
+        // If the value is still referenced, it is removed when the last
+        // `Entry` referencing it is dropped. A `VacantEntry` holds no value
+        // yet, so there is nothing to remove.
+        test_println!("rm_deferred {:?}", C::unpack_tid(idx));
+        self.shards
+            .get(C::unpack_tid(idx).as_usize())
+            .is_some_and(|shard| shard.mark(idx, false))
     }
 
     /// Removes the value associated with the given key from the slab, returning
@@ -577,15 +561,8 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// ```
     /// [`remove`]: Slab::remove
     pub fn take(&self, idx: usize) -> Option<T> {
-        let tid = C::unpack_tid(idx);
-
-        test_println!("rm {:?}", tid);
-        let shard = self.shards.get(tid.as_usize())?;
-        if tid.is_current() {
-            shard.take_local(idx)
-        } else {
-            shard.take_remote(idx)
-        }
+        test_println!("rm {:?}", C::unpack_tid(idx));
+        self.shards.get(C::unpack_tid(idx).as_usize())?.take(idx)
     }
 
     /// Return a reference to the value associated with the given key.
@@ -604,19 +581,11 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert!(slab.get(12345).is_none());
     /// ```
     pub fn get(&self, key: usize) -> Option<Entry<'_, T, C>> {
-        let tid = C::unpack_tid(key);
-
-        test_println!("get {:?}; current={:?}", tid, Tid::<C>::current());
-        let shard = self.shards.get(tid.as_usize())?;
-        shard.with_slot(key, |slot| {
-            let inner = slot.get(C::unpack_gen(key))?;
-            let value = ptr::NonNull::from(slot.value().as_ref().unwrap());
-            Some(Entry {
-                inner,
-                value,
-                shard,
-                key,
-            })
+        let (inner, value) = self.guard(key)?;
+        Some(Entry {
+            inner,
+            value,
+            _slab: PhantomData,
         })
     }
 
@@ -702,19 +671,11 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// [`get`]: Slab::get
     /// [`Arc`]: std::sync::Arc
     pub fn get_owned(self: Arc<Self>, key: usize) -> Option<OwnedEntry<T, C>> {
-        let tid = C::unpack_tid(key);
-
-        test_println!("get_owned {:?}; current={:?}", tid, Tid::<C>::current());
-        let shard = self.shards.get(tid.as_usize())?;
-        shard.with_slot(key, |slot| {
-            let inner = slot.get(C::unpack_gen(key))?;
-            let value = ptr::NonNull::from(slot.value().as_ref().unwrap());
-            Some(OwnedEntry {
-                inner,
-                value,
-                slab: self.clone(),
-                key,
-            })
+        let (inner, value) = self.guard(key)?;
+        Some(OwnedEntry {
+            inner,
+            value,
+            _slab: self,
         })
     }
 
@@ -732,7 +693,9 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert!(!slab.contains(key));
     /// ```
     pub fn contains(&self, key: usize) -> bool {
-        self.get(key).is_some()
+        self.shards
+            .get(C::unpack_tid(key).as_usize())
+            .is_some_and(|shard| shard.contains(key))
     }
 
     /// Returns an iterator over all the items in the slab.
@@ -757,6 +720,24 @@ impl<T, C: cfg::Config> Slab<T, C> {
             pages,
             slots,
         }
+    }
+
+    /// Acquires a guard for the value at `key`, and a pointer to the value.
+    ///
+    /// The slab must outlive the guard.
+    #[inline]
+    fn guard(&self, key: usize) -> Option<(SlabGuard<T, C>, NonNull<T>)> {
+        test_println!("get {:?}", C::unpack_tid(key));
+        let guard = self.shards.get(C::unpack_tid(key).as_usize())?.get(key)?;
+        // A published `Slab` slot always holds `Some`, since only
+        // `VacantEntry::insert` publishes values.
+        let value = NonNull::from(
+            guard
+                .value()
+                .as_ref()
+                .expect("published slot must have a value"),
+        );
+        Some((guard, value))
     }
 }
 
@@ -783,42 +764,22 @@ unsafe impl<T: Sync, C: cfg::Config> Sync for Slab<T, C> {}
 impl<T, C: cfg::Config> Entry<'_, T, C> {
     /// Returns the key used to access the guard.
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     #[inline(always)]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: this is always going to be valid, as it's projected from
-            // the safe reference to `self.value` --- this is just to avoid
-            // having to `expect` an option in the hot path when dereferencing.
-            self.value.as_ref()
-        }
+        // SAFETY: `value` points into the slot that `inner` keeps referenced;
+        // it is cached to avoid unwrapping the `Option` on every access.
+        unsafe { self.value.as_ref() }
     }
 }
 
-impl<T, C: cfg::Config> std::ops::Deref for Entry<'_, T, C> {
+impl<T, C: cfg::Config> Deref for Entry<'_, T, C> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         self.value()
-    }
-}
-
-impl<T, C: cfg::Config> Drop for Entry<'_, T, C> {
-    fn drop(&mut self) {
-        let should_remove = unsafe {
-            // Safety: calling `slot::Guard::release` is unsafe, since the
-            // `Guard` value contains a pointer to the slot that may outlive the
-            // slab containing that slot. Here, the `Entry` guard owns a
-            // borrowed reference to the shard containing that slot, which
-            // ensures that the slot will not be dropped while this `Guard`
-            // exists.
-            self.inner.release()
-        };
-        if should_remove {
-            self.shard.clear_after_release(self.key)
-        }
     }
 }
 
@@ -876,27 +837,15 @@ impl<T, C: cfg::Config> VacantEntry<'_, T, C> {
     /// ```
     ///
     /// [`key`]: VacantEntry::key
-    pub fn insert(mut self, val: T) {
-        let value = unsafe {
-            // Safety: this `VacantEntry` only lives as long as the `Slab` it was
-            // borrowed from, so it cannot outlive the entry's slot.
-            self.inner.value_mut()
-        };
+    pub fn insert(self, val: T) {
+        let mut inner = self.inner;
+        let value = inner.value_mut();
         debug_assert!(
             value.is_none(),
             "tried to insert to a slot that already had a value!"
         );
         *value = Some(val);
-        let _released = unsafe {
-            // Safety: again, this `VacantEntry` only lives as long as the
-            // `Slab` it was borrowed from, so it cannot outlive the entry's
-            // slot.
-            self.inner.release()
-        };
-        debug_assert!(
-            !_released,
-            "removing a value before it was inserted should be a no-op"
-        )
+        inner.publish();
     }
 
     /// Return the integer index at which this entry will be inserted.
@@ -921,7 +870,7 @@ impl<T, C: cfg::Config> VacantEntry<'_, T, C> {
     /// assert_eq!("hello", slab.get(hello).unwrap().1);
     /// ```
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 }
 // === impl OwnedEntry ===
@@ -932,21 +881,18 @@ where
 {
     /// Returns the key used to access this guard
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     #[inline(always)]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: this is always going to be valid, as it's projected from
-            // the safe reference to `self.value` --- this is just to avoid
-            // having to `expect` an option in the hot path when dereferencing.
-            self.value.as_ref()
-        }
+        // SAFETY: `value` points into the slot that `inner` keeps referenced;
+        // it is cached to avoid unwrapping the `Option` on every access.
+        unsafe { self.value.as_ref() }
     }
 }
 
-impl<T, C> std::ops::Deref for OwnedEntry<T, C>
+impl<T, C> Deref for OwnedEntry<T, C>
 where
     C: cfg::Config,
 {
@@ -954,36 +900,6 @@ where
 
     fn deref(&self) -> &Self::Target {
         self.value()
-    }
-}
-
-impl<T, C> Drop for OwnedEntry<T, C>
-where
-    C: cfg::Config,
-{
-    fn drop(&mut self) {
-        test_println!("drop OwnedEntry: try clearing data");
-        let should_clear = unsafe {
-            // Safety: calling `slot::Guard::release` is unsafe, since the
-            // `Guard` value contains a pointer to the slot that may outlive the
-            // slab containing that slot. Here, the `OwnedEntry` owns an `Arc`
-            // clone of the pool, which keeps it alive as long as the `OwnedEntry`
-            // exists.
-            self.inner.release()
-        };
-        if should_clear {
-            let shard_idx = Tid::<C>::from_packed(self.key);
-            test_println!("-> shard={:?}", shard_idx);
-            if let Some(shard) = self.slab.shards.get(shard_idx.as_usize()) {
-                shard.clear_after_release(self.key)
-            } else {
-                test_println!("-> shard={:?} does not exist! THIS IS A BUG", shard_idx);
-                debug_assert!(
-                    std::thread::panicking(),
-                    "[internal error] tried to drop an `OwnedEntry` to a slot on a shard that never existed!"
-                );
-            }
-        }
     }
 }
 

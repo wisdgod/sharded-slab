@@ -639,3 +639,47 @@ fn create_mut_downgrade_during_clear_by_other_thead() {
         t2.join().unwrap();
     });
 }
+
+/// `clear` racing with the release of a `RefMut` clears the value exactly
+/// once, whichever happens first (hawkw/sharded-slab#56).
+#[test]
+fn clear_races_with_ref_mut_release() {
+    run_model("clear_races_with_ref_mut_release", || {
+        let pool = Arc::new(Pool::<DontDropMe>::new());
+        let (state, value) = DontDropMe::new(1);
+        let mut guard = pool.create().unwrap();
+        *guard = value;
+        let key = guard.key();
+
+        let pool2 = pool.clone();
+        let t1 = thread::spawn(move || assert!(pool2.clear(key)));
+        drop(guard);
+        t1.join().unwrap();
+
+        state.assert_clear();
+        assert!(pool.get(key).is_none());
+    });
+}
+
+/// `clear` racing with a `RefMut` downgrade clears the value only once the
+/// downgraded `Ref` is dropped (hawkw/sharded-slab#55).
+#[test]
+fn clear_races_with_ref_mut_downgrade() {
+    run_model("clear_races_with_ref_mut_downgrade", || {
+        let pool = Arc::new(Pool::<DontDropMe>::new());
+        let (state, value) = DontDropMe::new(1);
+        let mut guard = pool.create().unwrap();
+        *guard = value;
+        let key = guard.key();
+
+        let pool2 = pool.clone();
+        let t1 = thread::spawn(move || assert!(pool2.clear(key)));
+        let guard = guard.downgrade();
+        state.assert_not_clear();
+        drop(guard);
+        t1.join().unwrap();
+
+        state.assert_clear();
+        assert!(pool.get(key).is_none());
+    });
+}

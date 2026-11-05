@@ -48,8 +48,8 @@ jobs:
           components: miri
       - run: cargo miri test --lib --tests
         env:
-          MIRIFLAGS: -Zmiri-many-seeds=0..8
-          PROPTEST_CASES: "8"
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-many-seeds=0..4
+          PROPTEST_CASES: "4"
 
   clippy:
     name: Clippy

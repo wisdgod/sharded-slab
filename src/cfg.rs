@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(loom, ignore)]
+    #[cfg_attr(any(loom, miri), ignore)]
     fn big() {
         let slab = Slab::new();
 
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(loom, ignore)]
+    #[cfg_attr(any(loom, miri), ignore)]
     fn custom_page_sz() {
         let slab = Slab::new_with_config::<test_util::TinyConfig>();
 

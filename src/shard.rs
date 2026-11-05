@@ -2,7 +2,7 @@ use crate::{
     Pack,
     cfg::{self, CfgPrivate},
     clear::Clear,
-    page,
+    page::{self, FreeList, Slot},
     sync::{
         alloc,
         atomic::{
@@ -13,7 +13,12 @@ use crate::{
     tid::Tid,
 };
 
-use std::{fmt, ptr, slice};
+use std::{
+    fmt,
+    mem::ManuallyDrop,
+    ptr::{self, NonNull},
+    slice,
+};
 
 // ┌─────────────┐      ┌────────┐
 // │ page 1      │      │        │
@@ -61,29 +66,29 @@ struct Ptr<T, C: cfg::Config>(AtomicPtr<alloc::Track<Shard<T, C>>>);
 #[derive(Debug)]
 pub(crate) struct IterMut<'a, T: 'a, C: cfg::Config + 'a>(slice::IterMut<'a, Ptr<T, C>>);
 
+/// A shared reference to a slot's value, released on drop.
+///
+/// The shard must outlive the guard; see [`Guard::new`].
+pub(crate) struct Guard<T: Clear, C: cfg::Config> {
+    shard: NonNull<Shard<T, C>>,
+    slot: NonNull<Slot<T, C>>,
+    key: usize,
+}
+
+/// Exclusive access to a slot's value, which is not yet visible to `get`.
+///
+/// Dropping it discards the slot (without publishing the value); see
+/// [`InitGuard::publish`] and [`InitGuard::downgrade`]. The shard must outlive
+/// the guard; see [`Shard::init`].
+pub(crate) struct InitGuard<T: Clear, C: cfg::Config> {
+    shard: NonNull<Shard<T, C>>,
+    slot: NonNull<Slot<T, C>>,
+    key: usize,
+}
+
 // === impl Shard ===
 
-impl<T, C> Shard<T, C>
-where
-    C: cfg::Config,
-{
-    #[inline(always)]
-    pub(crate) fn with_slot<'a, U>(
-        &'a self,
-        idx: usize,
-        f: impl FnOnce(&'a page::Slot<T, C>) -> Option<U>,
-    ) -> Option<U> {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        test_println!("-> {:?}", addr);
-        if page_index >= self.shared.len() {
-            return None;
-        }
-
-        self.shared[page_index].with_slot(addr, f)
-    }
-
+impl<T, C: cfg::Config> Shard<T, C> {
     pub(crate) fn new(tid: usize) -> Self {
         let mut total_sz = 0;
         let shared = (0..C::MAX_PAGES)
@@ -97,169 +102,276 @@ where
         let local = (0..C::MAX_PAGES).map(|_| page::Local::new()).collect();
         Self { tid, local, shared }
     }
-}
 
-impl<T, C> Shard<Option<T>, C>
-where
-    C: cfg::Config,
-{
-    /// Remove an item on the shard's local thread.
-    pub(crate) fn take_local(&self, idx: usize) -> Option<T> {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        test_println!("-> remove_local {:?}", addr);
-
-        self.shared
-            .get(page_index)?
-            .take(addr, C::unpack_gen(idx), self.local(page_index))
+    /// Returns `true` if the calling thread owns this shard.
+    #[inline]
+    fn is_local(&self) -> bool {
+        Tid::<C>::new(self.tid).is_current()
     }
 
-    /// Remove an item, while on a different thread from the shard's local thread.
-    pub(crate) fn take_remote(&self, idx: usize) -> Option<T> {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        debug_assert!(Tid::<C>::current().as_usize() != self.tid);
-
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        test_println!("-> take_remote {:?}; page {:?}", addr, page_index);
-
-        let shared = self.shared.get(page_index)?;
-        shared.take(addr, C::unpack_gen(idx), shared.free_list())
+    /// Looks up the page index and slot for `key`.
+    #[inline(always)]
+    fn slot(&self, key: usize) -> Option<(usize, &Slot<T, C>)> {
+        debug_assert_eq_in_drop!(Tid::<C>::from_packed(key).as_usize(), self.tid);
+        let (addr, page_index) = page::indices::<C>(key);
+        test_println!("-> {:?}", addr);
+        Some((page_index, self.shared.get(page_index)?.slot(addr)?))
     }
 
-    pub(crate) fn remove_local(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        self.shared[page_index].remove(addr, C::unpack_gen(idx), self.local(page_index))
+    /// Returns `true` if a value is present at `key`.
+    #[inline]
+    pub(crate) fn contains(&self, key: usize) -> bool {
+        self.slot(key)
+            .is_some_and(|(_, slot)| slot.is_present(C::unpack_gen(key)))
     }
 
-    pub(crate) fn remove_remote(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        let shared = &self.shared[page_index];
-        shared.remove(addr, C::unpack_gen(idx), shared.free_list())
-    }
-
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, page::Shared<Option<T>, C>> {
-        self.shared.iter()
-    }
-}
-
-impl<T, C> Shard<T, C>
-where
-    T: Clear + Default,
-    C: cfg::Config,
-{
-    pub(crate) fn init_with<U>(
-        &self,
-        mut init: impl FnMut(usize, &page::Slot<T, C>) -> Option<U>,
-    ) -> Option<U> {
-        // Can we fit the value into an exist`ing page?
-        for (page_idx, page) in self.shared.iter().enumerate() {
-            let local = self.local(page_idx);
-
-            test_println!("-> page {}; {:?}; {:?}", page_idx, local, page);
-
-            if let Some(res) = page.init_with(local, &mut init) {
-                return Some(res);
-            }
-        }
-
-        None
-    }
-
-    pub(crate) fn mark_clear_local(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        self.shared[page_index].mark_clear(addr, C::unpack_gen(idx), self.local(page_index))
-    }
-
-    pub(crate) fn mark_clear_remote(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        let shared = &self.shared[page_index];
-        shared.mark_clear(addr, C::unpack_gen(idx), shared.free_list())
-    }
-
-    pub(crate) fn clear_after_release(&self, idx: usize) {
-        crate::sync::atomic::fence(crate::sync::atomic::Ordering::Acquire);
-        let tid = Tid::<C>::current().as_usize();
-        test_println!(
-            "-> clear_after_release; self.tid={:?}; current.tid={:?};",
-            tid,
-            self.tid
-        );
-        if tid == self.tid {
-            self.clear_local(idx);
+    /// Pushes the claimed slot at `key` onto a free list.
+    fn push_free(&self, key: usize, page_index: usize, slot: &Slot<T, C>) {
+        let page = &self.shared[page_index];
+        let offset = page.offset(C::unpack_addr(key));
+        if self.is_local() {
+            test_println!("-> push local {:#x}", offset);
+            self.local(page_index).push(offset, slot);
         } else {
-            self.clear_remote(idx);
+            test_println!("-> push remote {:#x}", offset);
+            page.remote().push(offset, slot);
         }
-    }
-
-    fn clear_local(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        self.shared[page_index].clear(addr, C::unpack_gen(idx), self.local(page_index))
-    }
-
-    fn clear_remote(&self, idx: usize) -> bool {
-        debug_assert_eq_in_drop!(Tid::<C>::from_packed(idx).as_usize(), self.tid);
-        let (addr, page_index) = page::indices::<C>(idx);
-
-        if page_index >= self.shared.len() {
-            return false;
-        }
-
-        let shared = &self.shared[page_index];
-        shared.clear(addr, C::unpack_gen(idx), shared.free_list())
     }
 
     #[inline(always)]
     fn local(&self, i: usize) -> &page::Local {
-        #[cfg(debug_assertions)]
         debug_assert_eq_in_drop!(
-            Tid::<C>::current().as_usize(),
-            self.tid,
+            self.is_local(),
+            true,
             "tried to access local data from another thread!"
         );
-
         &self.local[i]
+    }
+}
+
+impl<T: Clear, C: cfg::Config> Shard<T, C> {
+    /// Acquires a shared reference to the value at `key`.
+    #[inline]
+    pub(crate) fn get(&self, key: usize) -> Option<Guard<T, C>> {
+        let (_, slot) = self.slot(key)?;
+        if !slot.get(C::unpack_gen(key)) {
+            return None;
+        }
+        Some(Guard {
+            shard: NonNull::from(self),
+            slot: NonNull::from(slot),
+            key,
+        })
+    }
+
+    /// Marks the value at `key` for removal, clearing it now if it is not
+    /// accessed, or once its last guard is dropped. Returns `false` if there
+    /// is no value at `key`.
+    ///
+    /// A value held by an [`InitGuard`] is marked only if `exclusive` is
+    /// `true`, and then cleared when the guard is released.
+    pub(crate) fn mark(&self, key: usize, exclusive: bool) -> bool {
+        let Some((page_index, slot)) = self.slot(key) else {
+            return false;
+        };
+        match slot.mark(C::unpack_gen(key), exclusive) {
+            None => false,
+            Some(false) => true,
+            Some(true) => {
+                // SAFETY: we claimed the slot.
+                unsafe { self.free(key, page_index, slot) };
+                true
+            }
+        }
+    }
+
+    /// Clears the claimed slot at `key` and pushes it onto a free list.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have claimed the slot.
+    unsafe fn free(&self, key: usize, page_index: usize, slot: &Slot<T, C>) {
+        // SAFETY: ensured by the caller.
+        unsafe { slot.clear() };
+        self.push_free(key, page_index, slot);
+    }
+
+    /// Clears the claimed slot at `key` and pushes it onto a free list.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have claimed the slot at `key`.
+    unsafe fn free_key(&self, key: usize) {
+        let (page_index, slot) = self.slot(key).expect("claimed slot must exist");
+        // SAFETY: ensured by the caller.
+        unsafe { self.free(key, page_index, slot) }
+    }
+
+    /// Takes a free slot and starts exclusive access to it, returning `None`
+    /// if the shard is full.
+    ///
+    /// Must be called only on the shard's owning thread. The shard must
+    /// outlive the returned guard.
+    pub(crate) fn init(&self) -> Option<InitGuard<T, C>>
+    where
+        T: Default,
+    {
+        for (page_index, page) in self.shared.iter().enumerate() {
+            test_println!("-> page {}; {:?}", page_index, page);
+            if let Some((addr, generation)) = page.init(self.local(page_index)) {
+                let key = Tid::<C>::new(self.tid).pack(generation.pack(addr.pack(0)));
+                let slot = page.slot(addr).expect("initialized slot must exist");
+                return Some(InitGuard {
+                    shard: NonNull::from(self),
+                    slot: NonNull::from(slot),
+                    key,
+                });
+            }
+        }
+        None
+    }
+}
+
+impl<T, C: cfg::Config> Shard<Option<T>, C> {
+    /// Removes and returns the value at `key`, waiting for outstanding
+    /// references to it to be released.
+    pub(crate) fn take(&self, key: usize) -> Option<T> {
+        let (page_index, slot) = self.slot(key)?;
+        if !slot.claim(C::unpack_gen(key)) {
+            return None;
+        }
+        // SAFETY: we claimed the slot.
+        let value = unsafe { slot.take() };
+        debug_assert!(value.is_some(), "claimed a slot with no value");
+        self.push_free(key, page_index, slot);
+        value
+    }
+
+    pub(crate) fn iter(&self) -> slice::Iter<'_, page::Shared<Option<T>, C>> {
+        self.shared.iter()
     }
 }
 
 impl<T: fmt::Debug, C: cfg::Config> fmt::Debug for Shard<T, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("Shard");
+        f.debug_struct("Shard")
+            .field("tid", &self.tid)
+            .field("shared", &self.shared)
+            .finish_non_exhaustive()
+    }
+}
 
-        #[cfg(debug_assertions)]
-        d.field("tid", &self.tid);
-        d.field("shared", &self.shared).finish()
+// === impl Guard ===
+
+impl<T: Clear, C: cfg::Config> Guard<T, C> {
+    #[inline(always)]
+    pub(crate) fn key(&self) -> usize {
+        self.key
+    }
+
+    #[inline(always)]
+    fn slot(&self) -> &Slot<T, C> {
+        // SAFETY: the shard containing the slot outlives the guard.
+        unsafe { self.slot.as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn value(&self) -> &T {
+        // SAFETY: we hold a reference to the slot.
+        unsafe { self.slot().item() }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> Clone for Guard<T, C> {
+    fn clone(&self) -> Self {
+        self.slot().clone_ref();
+        Self { ..*self }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> Drop for Guard<T, C> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.slot().release() {
+            // SAFETY: the shard outlives the guard, and we claimed the slot.
+            unsafe { self.shard.as_ref().free_key(self.key) };
+        }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> fmt::Debug for Guard<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Guard")
+            .field("key", &format_args!("{:#x}", self.key))
+            .field("slot", self.slot())
+            .finish()
+    }
+}
+
+// === impl InitGuard ===
+
+impl<T: Clear, C: cfg::Config> InitGuard<T, C> {
+    #[inline(always)]
+    pub(crate) fn key(&self) -> usize {
+        self.key
+    }
+
+    #[inline(always)]
+    fn slot(&self) -> &Slot<T, C> {
+        // SAFETY: the shard containing the slot outlives the guard.
+        unsafe { self.slot.as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn value(&self) -> &T {
+        // SAFETY: we have exclusive access to the slot.
+        unsafe { self.slot().item() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        // SAFETY: we have exclusive access to the slot, borrowed mutably.
+        unsafe { self.slot().item_mut() }
+    }
+
+    /// Publishes the value, making it accessible through its key.
+    #[inline]
+    pub(crate) fn publish(self) {
+        let this = ManuallyDrop::new(self);
+        if this.slot().publish(C::unpack_gen(this.key), 0) {
+            // SAFETY: the shard outlives the guard, and we claimed the slot.
+            unsafe { this.shard.as_ref().free_key(this.key) };
+        }
+    }
+
+    /// Publishes the value, returning a shared reference to it.
+    #[inline]
+    pub(crate) fn downgrade(self) -> Guard<T, C> {
+        let this = ManuallyDrop::new(self);
+        let claimed = this.slot().publish(C::unpack_gen(this.key), 1);
+        debug_assert!(!claimed, "publishing with a reference never claims");
+        Guard {
+            shard: this.shard,
+            slot: this.slot,
+            key: this.key,
+        }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> Drop for InitGuard<T, C> {
+    fn drop(&mut self) {
+        self.slot().discard(C::unpack_gen(self.key));
+        // SAFETY: the shard outlives the guard, and we claimed the slot.
+        unsafe { self.shard.as_ref().free_key(self.key) };
+    }
+}
+
+impl<T: Clear, C: cfg::Config> fmt::Debug for InitGuard<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitGuard")
+            .field("key", &format_args!("{:#x}", self.key))
+            .field("slot", self.slot())
+            .finish()
     }
 }
 

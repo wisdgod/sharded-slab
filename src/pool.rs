@@ -6,14 +6,19 @@
 //! [pool]: ../struct.Pool.html
 //! [`Slab`]: ../struct.Slab.html
 use crate::{
-    Pack, Shard,
+    Pack,
     cfg::{self, CfgPrivate, DefaultConfig},
     clear::Clear,
-    page, shard,
-    tid::Tid,
+    shard,
 };
-
-use std::{fmt, marker::PhantomData, sync::Arc};
+use std::{
+    fmt,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+    ptr,
+    sync::Arc,
+};
 
 /// A lock-free concurrent object pool.
 ///
@@ -100,9 +105,8 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
-    inner: page::slot::Guard<T, C>,
-    shard: &'a Shard<T, C>,
-    key: usize,
+    inner: shard::Guard<T, C>,
+    _pool: PhantomData<&'a Pool<T, C>>,
 }
 
 /// A guard that allows exclusive mutable access to an object in a pool.
@@ -117,9 +121,9 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
-    inner: page::slot::InitGuard<T, C>,
-    shard: &'a Shard<T, C>,
-    key: usize,
+    /// Published (or discarded, while unwinding) on drop.
+    inner: ManuallyDrop<shard::InitGuard<T, C>>,
+    _pool: PhantomData<&'a Pool<T, C>>,
 }
 
 /// An owned guard that allows shared immutable access to an object in a pool.
@@ -209,9 +213,9 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
-    inner: page::slot::Guard<T, C>,
-    pool: Arc<Pool<T, C>>,
-    key: usize,
+    // Declared before `_pool`, so that the guard is dropped first.
+    inner: shard::Guard<T, C>,
+    _pool: Arc<Pool<T, C>>,
 }
 
 /// An owned guard that allows exclusive, mutable access to an object in a pool.
@@ -373,9 +377,9 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
-    inner: page::slot::InitGuard<T, C>,
+    /// Published on drop, before `pool` is dropped.
+    inner: ManuallyDrop<shard::InitGuard<T, C>>,
     pool: Arc<Pool<T, C>>,
-    key: usize,
 }
 
 impl<T> Pool<T>
@@ -451,15 +455,9 @@ where
     pub fn create(&self) -> Option<RefMut<'_, T, C>> {
         let (tid, shard) = self.shards.current();
         test_println!("pool: create {:?}", tid);
-        let (key, inner) = shard.init_with(|idx, slot| {
-            let guard = slot.init()?;
-            let generation = guard.generation();
-            Some((generation.pack(idx), guard))
-        })?;
         Some(RefMut {
-            inner,
-            key: tid.pack(key),
-            shard,
+            inner: ManuallyDrop::new(shard.init()?),
+            _pool: PhantomData,
         })
     }
 
@@ -619,16 +617,8 @@ where
     pub fn create_owned(self: Arc<Self>) -> Option<OwnedRefMut<T, C>> {
         let (tid, shard) = self.shards.current();
         test_println!("pool: create_owned {:?}", tid);
-        let (inner, key) = shard.init_with(|idx, slot| {
-            let inner = slot.init()?;
-            let generation = inner.generation();
-            Some((inner, tid.pack(generation.pack(idx))))
-        })?;
-        Some(OwnedRefMut {
-            inner,
-            pool: self,
-            key,
-        })
+        let inner = ManuallyDrop::new(shard.init()?);
+        Some(OwnedRefMut { inner, pool: self })
     }
 
     /// Creates a new object in the pool with the provided initializer,
@@ -673,12 +663,10 @@ where
     /// assert!(pool.get(12345).is_none());
     /// ```
     pub fn get(&self, key: usize) -> Option<Ref<'_, T, C>> {
-        let tid = C::unpack_tid(key);
-
-        test_println!("pool: get{:?}; current={:?}", tid, Tid::<C>::current());
-        let shard = self.shards.get(tid.as_usize())?;
-        let inner = shard.with_slot(key, |slot| slot.get(C::unpack_gen(key)))?;
-        Some(Ref { inner, shard, key })
+        Some(Ref {
+            inner: self.guard(key)?,
+            _pool: PhantomData,
+        })
     }
 
     /// Return an owned reference to the value associated with the given key.
@@ -764,15 +752,9 @@ where
     /// [`OwnedRef`]: crate::pool::OwnedRef
     /// [`Ref`]: crate::pool::Ref
     pub fn get_owned(self: Arc<Self>, key: usize) -> Option<OwnedRef<T, C>> {
-        let tid = C::unpack_tid(key);
-
-        test_println!("pool: get{:?}; current={:?}", tid, Tid::<C>::current());
-        let shard = self.shards.get(tid.as_usize())?;
-        let inner = shard.with_slot(key, |slot| slot.get(C::unpack_gen(key)))?;
         Some(OwnedRef {
-            inner,
-            pool: self.clone(),
-            key,
+            inner: self.guard(key)?,
+            _pool: self,
         })
     }
 
@@ -818,18 +800,16 @@ where
     /// ```
     /// [`clear`]: #method.clear
     pub fn clear(&self, key: usize) -> bool {
-        let tid = C::unpack_tid(key);
+        self.shards
+            .get(C::unpack_tid(key).as_usize())
+            .is_some_and(|shard| shard.mark(key, true))
+    }
 
-        let shard = self.shards.get(tid.as_usize());
-        if tid.is_current() {
-            shard
-                .map(|shard| shard.mark_clear_local(key))
-                .unwrap_or(false)
-        } else {
-            shard
-                .map(|shard| shard.mark_clear_remote(key))
-                .unwrap_or(false)
-        }
+    /// Acquires a guard for the value at `key`. The pool must outlive it.
+    #[inline]
+    fn guard(&self, key: usize) -> Option<shard::Guard<T, C>> {
+        test_println!("pool: get {:?}", C::unpack_tid(key));
+        self.shards.get(C::unpack_tid(key).as_usize())?.get(key)
     }
 }
 
@@ -877,23 +857,16 @@ where
 {
     /// Returns the key used to access this guard
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     #[inline]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: calling `slot::Guard::value` is unsafe, since the `Guard`
-            // value contains a pointer to the slot that may outlive the slab
-            // containing that slot. Here, the `Ref` has a borrowed reference to
-            // the shard containing that slot, which ensures that the slot will
-            // not be dropped while this `Guard` exists.
-            self.inner.value()
-        }
+        self.inner.value()
     }
 }
 
-impl<T, C> std::ops::Deref for Ref<'_, T, C>
+impl<T, C> Deref for Ref<'_, T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
@@ -902,28 +875,6 @@ where
 
     fn deref(&self) -> &Self::Target {
         self.value()
-    }
-}
-
-impl<T, C> Drop for Ref<'_, T, C>
-where
-    T: Clear + Default,
-    C: cfg::Config,
-{
-    fn drop(&mut self) {
-        test_println!("drop Ref: try clearing data");
-        let should_clear = unsafe {
-            // Safety: calling `slot::Guard::release` is unsafe, since the
-            // `Guard` value contains a pointer to the slot that may outlive the
-            // slab containing that slot. Here, the `Ref` guard owns a
-            // borrowed reference to the shard containing that slot, which
-            // ensures that the slot will not be dropped while this `Ref`
-            // exists.
-            self.inner.release()
-        };
-        if should_clear {
-            self.shard.clear_after_release(self.key);
-        }
     }
 }
 
@@ -956,7 +907,7 @@ where
 {
     /// Returns the key used to access the guard.
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     /// Downgrades the mutable guard to an immutable guard, allowing access to
@@ -994,27 +945,23 @@ where
     /// // We can still access the value immutably through the downgraded guard.
     /// assert_eq!(guard, String::from("Hello"));
     /// ```
-    pub fn downgrade(mut self) -> Ref<'a, T, C> {
-        let inner = unsafe { self.inner.downgrade() };
+    pub fn downgrade(self) -> Ref<'a, T, C> {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again.
+        let inner = unsafe { ManuallyDrop::take(&mut this.inner) };
         Ref {
-            inner,
-            shard: self.shard,
-            key: self.key,
+            inner: inner.downgrade(),
+            _pool: PhantomData,
         }
     }
 
     #[inline]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: we are holding a reference to the shard which keeps the
-            // pointed slot alive. The returned reference will not outlive
-            // `self`.
-            self.inner.value()
-        }
+        self.inner.value()
     }
 }
 
-impl<T, C: cfg::Config> std::ops::Deref for RefMut<'_, T, C>
+impl<T, C: cfg::Config> Deref for RefMut<'_, T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
@@ -1026,17 +973,13 @@ where
     }
 }
 
-impl<T, C> std::ops::DerefMut for RefMut<'_, T, C>
+impl<T, C> DerefMut for RefMut<'_, T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            // Safety: we are holding a reference to the shard which keeps the
-            // pointed slot alive. The returned reference will not outlive `self`.
-            self.inner.value_mut()
-        }
+        self.inner.value_mut()
     }
 }
 
@@ -1046,15 +989,9 @@ where
     C: cfg::Config,
 {
     fn drop(&mut self) {
-        test_println!(" -> drop RefMut: try clearing data");
-        let should_clear = unsafe {
-            // Safety: we are holding a reference to the shard which keeps the
-            // pointed slot alive. The returned reference will not outlive `self`.
-            self.inner.release()
-        };
-        if should_clear {
-            self.shard.clear_after_release(self.key);
-        }
+        // SAFETY: `inner` is never used again.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        inner.publish();
     }
 }
 
@@ -1087,23 +1024,16 @@ where
 {
     /// Returns the key used to access this guard
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     #[inline]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: calling `slot::Guard::value` is unsafe, since the `Guard`
-            // value contains a pointer to the slot that may outlive the slab
-            // containing that slot. Here, the `Ref` has a borrowed reference to
-            // the shard containing that slot, which ensures that the slot will
-            // not be dropped while this `Guard` exists.
-            self.inner.value()
-        }
+        self.inner.value()
     }
 }
 
-impl<T, C> std::ops::Deref for OwnedRef<T, C>
+impl<T, C> Deref for OwnedRef<T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
@@ -1112,37 +1042,6 @@ where
 
     fn deref(&self) -> &Self::Target {
         self.value()
-    }
-}
-
-impl<T, C> Drop for OwnedRef<T, C>
-where
-    T: Clear + Default,
-    C: cfg::Config,
-{
-    fn drop(&mut self) {
-        test_println!("drop OwnedRef: try clearing data");
-        let should_clear = unsafe {
-            // Safety: calling `slot::Guard::release` is unsafe, since the
-            // `Guard` value contains a pointer to the slot that may outlive the
-            // slab containing that slot. Here, the `OwnedRef` owns an `Arc`
-            // clone of the pool, which keeps it alive as long as the `OwnedRef`
-            // exists.
-            self.inner.release()
-        };
-        if should_clear {
-            let shard_idx = Tid::<C>::from_packed(self.key);
-            test_println!("-> shard={:?}", shard_idx);
-            if let Some(shard) = self.pool.shards.get(shard_idx.as_usize()) {
-                shard.clear_after_release(self.key);
-            } else {
-                test_println!("-> shard={:?} does not exist! THIS IS A BUG", shard_idx);
-                debug_assert!(
-                    std::thread::panicking(),
-                    "[internal error] tried to drop an `OwnedRef` to a slot on a shard that never existed!"
-                );
-            }
-        }
     }
 }
 
@@ -1189,7 +1088,7 @@ where
 {
     /// Returns the key used to access this guard
     pub fn key(&self) -> usize {
-        self.key
+        self.inner.key()
     }
 
     /// Downgrades the owned mutable guard to an owned immutable guard, allowing
@@ -1227,35 +1126,24 @@ where
     /// // We can still access the value immutably through the downgraded guard.
     /// assert_eq!(guard, String::from("Hello"));
     /// ```
-    pub fn downgrade(mut self) -> OwnedRef<T, C> {
-        let inner = unsafe { self.inner.downgrade() };
+    pub fn downgrade(self) -> OwnedRef<T, C> {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again, so its fields are
+        // moved out exactly once.
+        let (inner, pool) = unsafe { (ManuallyDrop::take(&mut this.inner), ptr::read(&this.pool)) };
         OwnedRef {
-            inner,
-            pool: self.pool.clone(),
-            key: self.key,
+            inner: inner.downgrade(),
+            _pool: pool,
         }
-    }
-
-    fn shard(&self) -> Option<&Shard<T, C>> {
-        let shard_idx = Tid::<C>::from_packed(self.key);
-        test_println!("-> shard={:?}", shard_idx);
-        self.pool.shards.get(shard_idx.as_usize())
     }
 
     #[inline]
     fn value(&self) -> &T {
-        unsafe {
-            // Safety: calling `slot::InitGuard::value` is unsafe, since the `Guard`
-            // value contains a pointer to the slot that may outlive the slab
-            // containing that slot. Here, the `OwnedRefMut` has an `Arc` clone of
-            // the shard containing that slot, which ensures that the slot will
-            // not be dropped while this `Guard` exists.
-            self.inner.value()
-        }
+        self.inner.value()
     }
 }
 
-impl<T, C> std::ops::Deref for OwnedRefMut<T, C>
+impl<T, C> Deref for OwnedRefMut<T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
@@ -1267,20 +1155,13 @@ where
     }
 }
 
-impl<T, C> std::ops::DerefMut for OwnedRefMut<T, C>
+impl<T, C> DerefMut for OwnedRefMut<T, C>
 where
     T: Clear + Default,
     C: cfg::Config,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            // Safety: calling `slot::InitGuard::value_mut` is unsafe, since the
-            // `Guard`  value contains a pointer to the slot that may outlive
-            // the slab   containing that slot. Here, the `OwnedRefMut` has an
-            // `Arc` clone of the shard containing that slot, which ensures that
-            // the slot will not be dropped while this `Guard` exists.
-            self.inner.value_mut()
-        }
+        self.inner.value_mut()
     }
 }
 
@@ -1290,26 +1171,9 @@ where
     C: cfg::Config,
 {
     fn drop(&mut self) {
-        test_println!("drop OwnedRefMut: try clearing data");
-        let should_clear = unsafe {
-            // Safety: calling `slot::Guard::release` is unsafe, since the
-            // `Guard` value contains a pointer to the slot that may outlive the
-            // slab containing that slot. Here, the `OwnedRefMut` owns an `Arc`
-            // clone of the pool, which keeps it alive as long as the
-            // `OwnedRefMut` exists.
-            self.inner.release()
-        };
-        if should_clear {
-            if let Some(shard) = self.shard() {
-                shard.clear_after_release(self.key);
-            } else {
-                test_println!("-> shard does not exist! THIS IS A BUG");
-                debug_assert!(
-                    std::thread::panicking(),
-                    "[internal error] tried to drop an `OwnedRefMut` to a slot on a shard that never existed!"
-                );
-            }
-        }
+        // SAFETY: `inner` is never used again.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        inner.publish();
     }
 }
 

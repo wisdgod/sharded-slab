@@ -777,3 +777,45 @@ fn get_races_with_page_allocation() {
         t.join().unwrap();
     });
 }
+
+/// `take` and `remove` racing for the same key remove the value exactly once.
+#[test]
+fn take_races_with_remove() {
+    run_model("take_races_with_remove", || {
+        let slab = Arc::new(Slab::new());
+        let key = slab.insert(alloc::Track::new(1)).unwrap();
+
+        let slab2 = slab.clone();
+        let t1 = thread::spawn(move || slab2.remove(key));
+        let taken = slab.take(key);
+        let removed = t1.join().unwrap();
+
+        assert_ne!(
+            removed,
+            taken.is_some(),
+            "removed={removed} taken={taken:?}"
+        );
+        assert!(slab.get(key).is_none());
+    });
+}
+
+/// `take` waits for outstanding entries on other threads before returning
+/// the value.
+#[test]
+fn take_waits_for_remote_entry() {
+    run_model("take_waits_for_remote_entry", || {
+        let slab = Arc::new(Slab::new());
+        let key = slab
+            .insert(alloc::Track::new(String::from("hello")))
+            .unwrap();
+
+        let entry = slab.clone().get_owned(key).unwrap();
+        let t1 = thread::spawn(move || {
+            assert_eq!(entry.get_ref(), "hello");
+        });
+        let taken = slab.take(key).expect("take");
+        assert_eq!(taken.get_ref(), "hello");
+        assert!(slab.get(key).is_none());
+        t1.join().unwrap();
+    });
+}

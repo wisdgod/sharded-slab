@@ -1,6 +1,5 @@
 use crate::Pack;
 use crate::cfg::{self, CfgPrivate};
-use crate::clear::Clear;
 use crate::sync::{
     UnsafeCell,
     atomic::{AtomicPtr, Ordering},
@@ -42,6 +41,7 @@ impl<C: cfg::Config> Addr<C> {
     }
 }
 
+/// A free list that a claimed slot can be pushed onto.
 pub(crate) trait FreeList<C> {
     fn push<T>(&self, new_head: usize, slot: &Slot<T, C>)
     where
@@ -66,11 +66,28 @@ impl<C: cfg::Config> Pack<C> for Addr<C> {
     }
 }
 
-pub(crate) type Iter<'a, T, C> = std::iter::FilterMap<
-    std::slice::Iter<'a, Slot<Option<T>, C>>,
-    fn(&'a Slot<Option<T>, C>) -> Option<&'a T>,
->;
+/// An iterator over the values on a page of a slab that is exclusively
+/// borrowed.
+#[derive(Debug)]
+pub(crate) struct Iter<'a, T, C: cfg::Config>(std::slice::Iter<'a, Slot<Option<T>, C>>);
 
+impl<'a, T, C: cfg::Config> Iterator for Iter<'a, T, C> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        // SAFETY: an `Iter` is only created through `Slab::unique_iter`, which
+        // borrows the slab exclusively, so no slot is concurrently accessed.
+        self.0.find_map(|slot| unsafe { slot.item() }.as_ref())
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.0.size_hint().1)
+    }
+}
+
+/// The free list of a page that only the shard's owning thread accesses.
 pub(crate) struct Local {
     /// Index of the first slot on the local free list
     head: UnsafeCell<usize>,
@@ -106,14 +123,14 @@ impl Local {
 
     #[inline(always)]
     fn head(&self) -> usize {
+        // SAFETY: only the shard's owning thread accesses its local free lists.
         self.head.with(|head| unsafe { *head })
     }
 
     #[inline(always)]
     fn set_head(&self, new_head: usize) {
-        self.head.with_mut(|head| unsafe {
-            *head = new_head;
-        })
+        // SAFETY: only the shard's owning thread accesses its local free lists.
+        self.head.with_mut(|head| unsafe { *head = new_head })
     }
 }
 
@@ -124,10 +141,7 @@ impl<C: cfg::Config> FreeList<C> for Local {
     }
 }
 
-impl<T, C> Shared<T, C>
-where
-    C: cfg::Config,
-{
+impl<T, C: cfg::Config> Shared<T, C> {
     const NULL: usize = Addr::<C>::NULL;
 
     pub(crate) fn new(size: usize, prev_sz: usize) -> Self {
@@ -152,15 +166,29 @@ where
         Some(unsafe { &*ptr::slice_from_raw_parts(ptr, self.size) })
     }
 
+    /// Returns the slot at `addr`, which must be an address on this page.
     #[inline(always)]
-    fn slot(&self, offset: usize) -> Option<&Slot<T, C>> {
-        self.slots()?.get(offset)
+    pub(crate) fn slot(&self, addr: Addr<C>) -> Option<&Slot<T, C>> {
+        self.slots()?.get(self.offset(addr))
     }
 
-    /// Return the head of the freelist
+    /// The offset of `addr` (which must be on this page) within the page.
+    #[inline(always)]
+    pub(crate) fn offset(&self, addr: Addr<C>) -> usize {
+        addr.offset() - self.prev_sz
+    }
+
+    /// The remote free list, for slots freed by threads other than the
+    /// shard's owner.
+    #[inline(always)]
+    pub(crate) fn remote(&self) -> &impl FreeList<C> {
+        &self.remote
+    }
+
+    /// Pops the head of the free list.
     ///
-    /// If there is space on the local list, it returns the head of the local list. Otherwise, it
-    /// pops all the slots from the global list and returns the head of that list
+    /// If the local free list is empty, takes all the slots on the remote
+    /// free list, the head of which is returned.
     ///
     /// *Note*: The local list's head is reset when setting the new state in the slot pointed to be
     /// `head` returned from this function
@@ -171,184 +199,78 @@ where
         test_println!("-> local head {:?}", head);
 
         // are there any items on the local free list? (fast path)
-        let head = if head < self.size {
-            head
-        } else {
-            // slow path: if the local free list is empty, pop all the items on
-            // the remote free list.
-            let head = self.remote.pop_all();
-
-            test_println!("-> remote head {:?}", head);
-            head?
-        };
-
-        // if the head is still null, both the local and remote free lists are
-        // empty --- we can't fit any more items on this page.
-        if head == Self::NULL {
-            test_println!("-> NULL! {:?}", head);
-            None
-        } else {
-            Some(head)
+        if head < self.size {
+            return Some(head);
         }
+
+        // slow path: if the local free list is empty, pop all the items on
+        // the remote free list.
+        let head = self.remote.pop_all()?;
+        test_println!("-> remote head {:?}", head);
+        Some(head)
     }
 
-    /// Returns `true` if storage is currently allocated for this page, `false`
-    /// otherwise.
-    #[inline]
-    fn is_unallocated(&self) -> bool {
-        self.slots.load(Ordering::Relaxed).is_null()
-    }
-
-    #[inline]
-    pub(crate) fn with_slot<'a, U>(
-        &'a self,
-        addr: Addr<C>,
-        f: impl FnOnce(&'a Slot<T, C>) -> Option<U>,
-    ) -> Option<U> {
-        let poff = addr.offset() - self.prev_sz;
-
-        test_println!("-> offset {:?}", poff);
-
-        f(self.slot(poff)?)
-    }
-
-    #[inline(always)]
-    pub(crate) fn free_list(&self) -> &(impl FreeList<C> + use<T, C>) {
-        &self.remote
-    }
-}
-
-impl<'a, T, C> Shared<Option<T>, C>
-where
-    C: cfg::Config + 'a,
-{
-    pub(crate) fn take<F>(
-        &self,
-        addr: Addr<C>,
-        generation: slot::Generation<C>,
-        free_list: &F,
-    ) -> Option<T>
+    /// Takes a slot off the free list and starts exclusive access to it,
+    /// returning its address and the generation of its new value. Returns
+    /// `None` if the page is full.
+    ///
+    /// Must be called only on the shard's owning thread.
+    pub(crate) fn init(&self, local: &Local) -> Option<(Addr<C>, slot::Generation<C>)>
     where
-        F: FreeList<C>,
+        T: Default,
     {
-        let offset = addr.offset() - self.prev_sz;
-
-        test_println!("-> take: offset {:?}", offset);
-
-        self.slot(offset)?
-            .remove_value(generation, offset, free_list)
-    }
-
-    pub(crate) fn remove<F: FreeList<C>>(
-        &self,
-        addr: Addr<C>,
-        generation: slot::Generation<C>,
-        free_list: &F,
-    ) -> bool {
-        let offset = addr.offset() - self.prev_sz;
-
-        test_println!("-> offset {:?}", offset);
-
-        self.slot(offset)
-            .is_some_and(|slot| slot.try_remove_value(generation, offset, free_list))
-    }
-
-    // Need this function separately, as we need to pass a function pointer to `filter_map` and
-    // `Slot::value` just returns a `&T`, specifically a `&Option<T>` for this impl.
-    fn make_ref(slot: &'a Slot<Option<T>, C>) -> Option<&'a T> {
-        slot.value().as_ref()
-    }
-
-    pub(crate) fn iter(&'a self) -> Option<Iter<'a, T, C>> {
-        let slots = self.slots()?;
-        Some(
-            slots
-                .iter()
-                .filter_map(Shared::make_ref as fn(&'a Slot<Option<T>, C>) -> Option<&'a T>),
-        )
-    }
-}
-
-impl<T, C> Shared<T, C>
-where
-    T: Clear + Default,
-    C: cfg::Config,
-{
-    pub(crate) fn init_with<U>(
-        &self,
-        local: &Local,
-        init: impl FnOnce(usize, &Slot<T, C>) -> Option<U>,
-    ) -> Option<U> {
         let head = self.pop(local)?;
 
         // do we need to allocate storage for this page?
-        if self.is_unallocated() {
-            self.allocate();
-        }
-
-        let index = head + self.prev_sz;
-
-        let slot = &self
-            .slots()
-            .expect("page must have been allocated to insert!")[head];
-        let result = init(index, slot)?;
+        let slots = match self.slots() {
+            Some(slots) => slots,
+            None => self.allocate(),
+        };
+        let slot = &slots[head];
         local.set_head(slot.next());
-
-        test_println!("-> init_with: insert at offset: {}", index);
-        Some(result)
+        let generation = slot.init();
+        let addr = Addr::from_usize(head + self.prev_sz);
+        test_println!("-> init: {:?} {:?}", addr, generation);
+        Some((addr, generation))
     }
 
     /// Allocates storage for the page's slots.
     #[cold]
-    fn allocate(&self) {
+    fn allocate(&self) -> &[Slot<T, C>]
+    where
+        T: Default,
+    {
         test_println!("-> alloc new page ({})", self.size);
-        debug_assert!(self.is_unallocated());
+        debug_assert!(self.slots.load(Ordering::Relaxed).is_null());
 
         let slots: Box<[Slot<T, C>]> = (1..self.size).chain([Self::NULL]).map(Slot::new).collect();
         debug_assert_eq!(slots.len(), self.size);
+        let slots = Box::into_raw(slots);
         // Only the owning thread allocates, so a plain `Release` store (rather
         // than a CAS) suffices to publish the initialized slots.
         self.slots
-            .store(Box::into_raw(slots).cast::<Slot<T, C>>(), Ordering::Release);
+            .store(slots.cast::<Slot<T, C>>(), Ordering::Release);
+        // SAFETY: just allocated, and freed only when `self` is dropped. The
+        // reference is derived from the same raw pointer that was published,
+        // so that accesses through either one remain valid.
+        unsafe { &*slots }
     }
+}
 
-    pub(crate) fn mark_clear<F: FreeList<C>>(
-        &self,
-        addr: Addr<C>,
-        generation: slot::Generation<C>,
-        free_list: &F,
-    ) -> bool {
-        let offset = addr.offset() - self.prev_sz;
-
-        test_println!("-> offset {:?}", offset);
-
-        self.slot(offset)
-            .is_some_and(|slot| slot.try_clear_storage(generation, offset, free_list))
-    }
-
-    pub(crate) fn clear<F: FreeList<C>>(
-        &self,
-        addr: Addr<C>,
-        generation: slot::Generation<C>,
-        free_list: &F,
-    ) -> bool {
-        let offset = addr.offset() - self.prev_sz;
-
-        test_println!("-> offset {:?}", offset);
-
-        self.slot(offset)
-            .is_some_and(|slot| slot.clear_storage(generation, offset, free_list))
+impl<T, C: cfg::Config> Shared<Option<T>, C> {
+    /// Iterates over the values on the page.
+    ///
+    /// Must only be called while the slab is exclusively borrowed.
+    pub(crate) fn iter(&self) -> Option<Iter<'_, T, C>> {
+        Some(Iter(self.slots()?.iter()))
     }
 }
 
 impl fmt::Debug for Local {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.head.with(|head| {
-            let head = unsafe { *head };
-            f.debug_struct("Local")
-                .field("head", &format_args!("{:#0x}", head))
-                .finish()
-        })
+        f.debug_struct("Local")
+            .field("head", &format_args!("{:#0x}", self.head()))
+            .finish()
     }
 }
 
@@ -372,8 +294,7 @@ impl<C, T> fmt::Debug for Shared<C, T> {
             .field("remote", &self.remote)
             .field("prev_sz", &self.prev_sz)
             .field("size", &self.size)
-            // .field("slab", &self.slab)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

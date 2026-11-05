@@ -17,7 +17,9 @@ use proptest::prelude::*;
 use crate::{Config, DefaultConfig, Slab, tid};
 
 const THREADS: Range<usize> = 1..4;
-const ACTIONS: Range<usize> = 1..1000;
+// Miri interprets every operation, so long action sequences take it hours;
+// it checks the memory model, for which short sequences suffice.
+const ACTIONS: Range<usize> = if cfg!(miri) { 1..100 } else { 1..1000 };
 
 #[derive(Debug, Clone)]
 struct Action {
