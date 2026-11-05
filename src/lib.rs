@@ -226,15 +226,16 @@ pub use pool::Pool;
 pub(crate) use tid::Tid;
 
 use cfg::{CfgPrivate, WIDTH};
+use page::slot::Value;
 use std::{fmt, marker::PhantomData, ops::Deref, ptr::NonNull, sync::Arc};
 
-type SlabGuard<T, C> = shard::Guard<Option<T>, C>;
+type SlabGuard<T, C> = shard::Guard<Value<T>, C>;
 
 /// A sharded slab.
 ///
 /// See the [crate-level documentation](crate) for details on using this type.
 pub struct Slab<T, C: cfg::Config = DefaultConfig> {
-    shards: shard::Array<Option<T>, C>,
+    shards: shard::Array<Value<T>, C>,
     _cfg: PhantomData<C>,
 }
 
@@ -274,7 +275,7 @@ pub struct Entry<'a, T, C: cfg::Config = DefaultConfig> {
 /// ```
 #[derive(Debug)]
 pub struct VacantEntry<'a, T, C: cfg::Config = DefaultConfig> {
-    inner: shard::InitGuard<Option<T>, C>,
+    inner: shard::InitGuard<Value<T>, C>,
     _slab: PhantomData<&'a Slab<T, C>>,
 }
 
@@ -760,17 +761,22 @@ impl<T, C: cfg::Config> Slab<T, C> {
     fn guard(&self, key: usize) -> Option<(SlabGuard<T, C>, NonNull<T>)> {
         test_println!("get {:?}", C::unpack_tid(key));
         let guard = self.shards.get(C::unpack_tid(key).as_usize())?.get(key)?;
-        // A published `Slab` slot always holds `Some`, since only
-        // `VacantEntry::insert` publishes values.
-        //
-        // This must not be a panicking `expect`: unwinding while `guard` is
-        // live forces it to be spilled to the stack, and the stores then delay
-        // the `lock cmpxchg` releasing it, doubling the cost of `get`.
-        let value = guard.value();
-        debug_assert!(value.is_some(), "published slot must have a value");
-        // SAFETY: as above, a published slot always holds `Some`.
-        let value = NonNull::from(unsafe { value.as_ref().unwrap_unchecked() });
+        // SAFETY: a published value is initialized.
+        let value = NonNull::from(unsafe { guard.value().get() });
         Some((guard, value))
+    }
+}
+
+impl<T, C: cfg::Config> Drop for Slab<T, C> {
+    fn drop(&mut self) {
+        for shard in self.shards.iter_mut() {
+            for page in shard.iter() {
+                // SAFETY: `&mut self` guarantees no guard exists (an
+                // `OwnedEntry` drops its guard before its `Arc<Slab>`), and the
+                // values are not accessed again.
+                unsafe { page.drop_values() };
+            }
+        }
     }
 }
 
@@ -901,12 +907,7 @@ impl<T, C: cfg::Config> VacantEntry<'_, T, C> {
     /// [`key`]: VacantEntry::key
     pub fn insert(self, val: T) {
         let mut inner = self.inner;
-        let value = inner.value_mut();
-        debug_assert!(
-            value.is_none(),
-            "tried to insert to a slot that already had a value!"
-        );
-        *value = Some(val);
+        inner.value_mut().write(val);
         inner.publish();
     }
 

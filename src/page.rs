@@ -1,3 +1,4 @@
+use self::slot::Value;
 use crate::Pack;
 use crate::cfg::{self, CfgPrivate};
 use crate::sync::{
@@ -69,7 +70,7 @@ impl<C: cfg::Config> Pack<C> for Addr<C> {
 /// An iterator over the values on a page of a slab that is exclusively
 /// borrowed.
 #[derive(Debug)]
-pub(crate) struct Iter<'a, T, C: cfg::Config>(std::slice::Iter<'a, Slot<Option<T>, C>>);
+pub(crate) struct Iter<'a, T, C: cfg::Config>(std::slice::Iter<'a, Slot<Value<T>, C>>);
 
 impl<'a, T, C: cfg::Config> Iterator for Iter<'a, T, C> {
     type Item = &'a T;
@@ -78,7 +79,9 @@ impl<'a, T, C: cfg::Config> Iterator for Iter<'a, T, C> {
     fn next(&mut self) -> Option<&'a T> {
         // SAFETY: an `Iter` is only created through `Slab::unique_iter`, which
         // borrows the slab exclusively, so no slot is concurrently accessed.
-        self.0.find_map(|slot| unsafe { slot.item() }.as_ref())
+        self.0
+            .find(|slot| slot.is_published())
+            .map(|slot| unsafe { slot.item().get() })
     }
 
     #[inline]
@@ -257,7 +260,23 @@ impl<T, C: cfg::Config> Shared<T, C> {
     }
 }
 
-impl<T, C: cfg::Config> Shared<Option<T>, C> {
+impl<T, C: cfg::Config> Shared<Value<T>, C> {
+    /// Drops the published values on the page.
+    ///
+    /// # Safety
+    ///
+    /// The slab must be exclusively borrowed, and no value may be accessed
+    /// afterwards.
+    pub(crate) unsafe fn drop_values(&self) {
+        for slot in self.slots().into_iter().flatten() {
+            if slot.is_published() {
+                // SAFETY: published values are initialized, and ensured by
+                // the caller.
+                unsafe { slot.clear() }
+            }
+        }
+    }
+
     /// Iterates over the values on the page.
     ///
     /// Must only be called while the slab is exclusively borrowed.

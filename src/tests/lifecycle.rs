@@ -181,3 +181,36 @@ fn get_mut() {
     drop(entry);
     assert!(slab.get_mut(key).is_none());
 }
+
+/// Every value is dropped exactly once, however it leaves the slab.
+#[test]
+fn values_dropped_exactly_once() {
+    use std::sync::Arc;
+    let tracker = Arc::new(());
+    let live = || Arc::strong_count(&tracker) - 1;
+    {
+        let slab = Slab::new();
+        let removed = slab.insert(tracker.clone()).unwrap();
+        let taken = slab.insert(tracker.clone()).unwrap();
+        let referenced = slab.insert(tracker.clone()).unwrap();
+        let _kept = slab.insert(tracker.clone()).unwrap();
+        assert_eq!(live(), 4);
+
+        assert!(slab.remove(removed));
+        assert_eq!(live(), 3);
+        drop(slab.take(taken).unwrap());
+        assert_eq!(live(), 2);
+
+        let entry = slab.get(referenced).unwrap();
+        assert!(slab.remove(referenced));
+        assert_eq!(live(), 2, "removed while referenced");
+        drop(entry);
+        assert_eq!(live(), 1);
+
+        // Discarding a `VacantEntry` drops nothing; inserting moves in.
+        drop(slab.vacant_entry().unwrap());
+        slab.vacant_entry().unwrap().insert(tracker.clone());
+        assert_eq!(live(), 2);
+    }
+    assert_eq!(live(), 0, "values leaked when the slab was dropped");
+}

@@ -2,7 +2,7 @@ use crate::{
     Pack,
     cfg::{self, CfgPrivate},
     clear::Clear,
-    page::{self, FreeList, Slot},
+    page::{self, FreeList, Slot, slot::Value},
     sync::{
         alloc,
         atomic::{
@@ -232,15 +232,16 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
     }
 }
 
-impl<T, C: cfg::Config> Shard<Option<T>, C> {
+impl<T, C: cfg::Config> Shard<Value<T>, C> {
     /// Returns a mutable reference to the value at `key`.
     pub(crate) fn get_mut(&mut self, key: usize) -> Option<&mut T> {
         let (_, slot) = self.slot(key)?;
         if !slot.is_present(C::unpack_gen(key)) {
             return None;
         }
-        // SAFETY: `&mut self` guarantees that no guard to the slot exists.
-        unsafe { slot.item_mut() }.as_mut()
+        // SAFETY: `&mut self` guarantees that no guard to the slot exists, and
+        // a present value is initialized.
+        Some(unsafe { slot.item_mut().get_mut() })
     }
 
     /// Removes and returns the value at `key`, waiting for outstanding
@@ -250,14 +251,13 @@ impl<T, C: cfg::Config> Shard<Option<T>, C> {
         if !slot.claim(C::unpack_gen(key)) {
             return None;
         }
-        // SAFETY: we claimed the slot.
+        // SAFETY: we claimed the slot of a published value.
         let value = unsafe { slot.take() };
-        debug_assert!(value.is_some(), "claimed a slot with no value");
         self.push_free(key, page_index, slot);
-        value
+        Some(value)
     }
 
-    pub(crate) fn iter(&self) -> slice::Iter<'_, page::Shared<Option<T>, C>> {
+    pub(crate) fn iter(&self) -> slice::Iter<'_, page::Shared<Value<T>, C>> {
         self.shared.iter()
     }
 }
@@ -371,8 +371,12 @@ impl<T: Clear, C: cfg::Config> InitGuard<T, C> {
 impl<T: Clear, C: cfg::Config> Drop for InitGuard<T, C> {
     fn drop(&mut self) {
         self.slot().discard(C::unpack_gen(self.key));
-        // SAFETY: the shard outlives the guard, and we claimed the slot.
-        unsafe { self.shard.as_ref().free_key(self.key) };
+        // The value was never published, so it is not cleared: a `Slab`'s is
+        // uninitialized, and a `Pool`'s (which never discards) stays valid.
+        // SAFETY: the shard outlives the guard.
+        let shard = unsafe { self.shard.as_ref() };
+        let (page_index, _) = shard.slot(self.key).expect("claimed slot must exist");
+        shard.push_free(self.key, page_index, self.slot());
     }
 }
 

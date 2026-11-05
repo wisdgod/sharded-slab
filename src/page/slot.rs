@@ -38,7 +38,7 @@ use crate::sync::{
     hint,
 };
 use crate::{Pack, Tid, cfg, clear::Clear};
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, mem::MaybeUninit};
 
 pub(crate) struct Slot<T, C> {
     lifecycle: AtomicUsize,
@@ -478,16 +478,83 @@ impl<T, C: cfg::Config> Slot<T, C> {
     }
 }
 
-impl<T, C: cfg::Config> Slot<Option<T>, C> {
-    /// Takes the item out.
+/// Storage for a `Slab` value.
+///
+/// The slot's lifecycle tracks whether it is initialized, so no `Option` tag
+/// is needed: it is initialized while the slot holds a published value
+/// (`Present` or `Marked`), from `VacantEntry::insert` until publishing, and
+/// until the claimer of a published value drops or takes it.
+pub(crate) struct Value<T>(MaybeUninit<T>);
+
+/// The value may be uninitialized, so it is not printed.
+impl<T> fmt::Debug for Value<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Value")
+    }
+}
+
+impl<T> Default for Value<T> {
+    #[inline]
+    fn default() -> Self {
+        Self(MaybeUninit::uninit())
+    }
+}
+
+/// Only called on the claimed slot of a published value, which is
+/// initialized.
+impl<T> Clear for Value<T> {
+    #[inline]
+    fn clear(&mut self) {
+        // SAFETY: see above.
+        unsafe { self.0.assume_init_drop() }
+    }
+}
+
+impl<T> Value<T> {
+    /// # Safety
+    ///
+    /// The value must be initialized.
+    #[inline(always)]
+    pub(crate) unsafe fn get(&self) -> &T {
+        // SAFETY: ensured by the caller.
+        unsafe { self.0.assume_init_ref() }
+    }
+
+    /// # Safety
+    ///
+    /// The value must be initialized.
+    #[inline(always)]
+    pub(crate) unsafe fn get_mut(&mut self) -> &mut T {
+        // SAFETY: ensured by the caller.
+        unsafe { self.0.assume_init_mut() }
+    }
+
+    /// Initializes the value, which must be uninitialized (or it leaks).
+    #[inline(always)]
+    pub(crate) fn write(&mut self, value: T) {
+        self.0.write(value);
+    }
+}
+
+impl<T, C: cfg::Config> Slot<Value<T>, C> {
+    /// Moves the value out, leaving the slot uninitialized.
     ///
     /// # Safety
     ///
-    /// The caller must have claimed the slot.
+    /// The caller must have claimed the slot of a published value.
     #[inline]
-    pub(crate) unsafe fn take(&self) -> Option<T> {
-        // SAFETY: ensured by the caller.
-        unsafe { self.item_mut() }.take()
+    pub(crate) unsafe fn take(&self) -> T {
+        // SAFETY: ensured by the caller; the slot is not read again before it
+        // is reinitialized.
+        unsafe { self.item_mut().0.assume_init_read() }
+    }
+
+    /// Returns `true` if the slot holds a published value.
+    ///
+    /// Only meaningful while the slab is exclusively borrowed.
+    #[inline]
+    pub(crate) fn is_published(&self) -> bool {
+        self.load(Relaxed).state == State::Present
     }
 }
 
