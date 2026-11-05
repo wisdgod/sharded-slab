@@ -1,3 +1,47 @@
+## Unreleased
+
+Maintained fork of [`hawkw/sharded-slab`](https://github.com/hawkw/sharded-slab),
+starting from upstream `168eae4`. Issue and PR numbers below refer to the
+upstream repository.
+
+#### Breaking Changes
+
+*   MSRV is the latest stable Rust (1.99), edition 2024.
+*   `Slab`/`Pool` are `Sync` only if `T: Send + Sync`, and guards are `Send`
+    only if `T: Send + Sync`: values could previously be moved to, dropped on,
+    or mutated from threads they cannot be sent to, in safe code.
+*   An invalid `Config` is a compile error instead of a runtime panic (#68, #115).
+*   A thread that cannot be assigned a shard (more than `MAX_THREADS` threads,
+    or an exiting thread) gets `None` from `insert`/`vacant_entry`/`create*`
+    instead of a panic (#62, #95).
+
+#### Bug Fixes
+
+*   data race between lazy page allocation and remote lookups (#116).
+*   slot lifecycle redesign, fixing: a slot handed out twice after `take` with a
+    forged next-generation key; un-inserted `VacantEntry`s visible to `get`;
+    `Pool::clear` clearing a value under a live `RefMut`, or being ignored and
+    leaking it (#56); reference count underflow after `RefMut::downgrade` (#55);
+    a leaked slot when a `VacantEntry` is dropped without inserting.
+*   generation counters wrap at their full width.
+
+#### Features
+
+*   `Slab::get_mut` (#97).
+*   `Clone` for `Entry`, `OwnedEntry`, `pool::Ref`, `pool::OwnedRef` (#38).
+*   borrowed pool guards are `Send` (#43).
+
+#### Performance
+
+*   `contains` is a single atomic load; `insert`/`remove`, `unique_iter`, and
+    `Pool::create`/`clear` are faster; releasing guards and removing values no
+    longer register the calling thread.
+
+#### Other
+
+*   no dependencies (`lazy_static` is gone, #71); Miri, loom, and 32-bit CI
+    (#12, #17).
+
 <a name="v0.1.7"></a>
 ### v0.1.7 (2023-10-04)
 

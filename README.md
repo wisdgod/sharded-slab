@@ -26,6 +26,12 @@ creating and removing new items can be very cheap.
 
 This crate implements a lock-free concurrent slab, indexed by `usize`s.
 
+This is a maintained fork of [`hawkw/sharded-slab`]. It targets the latest
+stable Rust release only. See the [changelog](CHANGELOG.md) for how it differs
+from upstream, including soundness fixes.
+
+[`hawkw/sharded-slab`]: https://github.com/hawkw/sharded-slab
+
 **Note**: This crate is currently experimental. Please feel free to use it in
 your projects, but bear in mind that there's still plenty of room for
 optimization, and there may still be some lurking bugs.
