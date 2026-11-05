@@ -178,7 +178,7 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
             Get::Absent => return None,
             Get::Claimed => {
                 // SAFETY: undoing our speculative reference claimed the slot.
-                unsafe { self.free(key, page_index, slot) };
+                unsafe { self.free_cold(key, page_index, slot) };
                 return None;
             }
         }
@@ -221,11 +221,29 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
         self.push_free(key, page_index, slot);
     }
 
+    /// [`Shard::free`], kept out of line so that the hot paths that rarely
+    /// need it (acquiring and releasing references) stay small enough to be
+    /// inlined into callers.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have claimed the slot.
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_cold(&self, key: usize, page_index: usize, slot: &Slot<T, C>) {
+        // SAFETY: ensured by the caller.
+        unsafe { self.free(key, page_index, slot) }
+    }
+
     /// Clears the claimed slot at `key` and pushes it onto a free list.
+    ///
+    /// Kept out of line for the same reason as [`Shard::free_cold`].
     ///
     /// # Safety
     ///
     /// The caller must have claimed the slot at `key`.
+    #[cold]
+    #[inline(never)]
     unsafe fn free_key(&self, key: usize) {
         let (page_index, slot) = self.slot(key).expect("claimed slot must exist");
         // SAFETY: ensured by the caller.

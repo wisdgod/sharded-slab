@@ -586,6 +586,7 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert_eq!(slab.get(key).unwrap(), "hello world");
     /// assert!(slab.get(12345).is_none());
     /// ```
+    #[inline]
     pub fn get(&self, key: usize) -> Option<Entry<'_, T, C>> {
         let (inner, value) = self.guard(key)?;
         Some(Entry {

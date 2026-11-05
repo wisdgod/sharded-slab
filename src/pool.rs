@@ -672,6 +672,7 @@ where
     /// assert_eq!(pool.get(key).unwrap(), String::from("hello world"));
     /// assert!(pool.get(12345).is_none());
     /// ```
+    #[inline]
     pub fn get(&self, key: usize) -> Option<Ref<'_, T, C>> {
         Some(Ref {
             inner: self.guard(key)?,
