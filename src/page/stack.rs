@@ -91,18 +91,18 @@ mod test {
             let t1 = thread::spawn(move || {
                 let (causalities, stack) = &*shared1;
                 stack.push(0, |prev| {
-                    causalities[0].with_mut(|c| unsafe {
-                        *c = 0;
-                    });
+                    // SAFETY: only this thread writes this cell, and the
+                    // main thread reads it only after popping index 0.
+                    causalities[0].with_mut(|c| unsafe { *c = 0 });
                     test_println!("prev={:#x}", prev)
                 });
             });
             let t2 = thread::spawn(move || {
                 let (causalities, stack) = &*shared2;
                 stack.push(1, |prev| {
-                    causalities[1].with_mut(|c| unsafe {
-                        *c = 1;
-                    });
+                    // SAFETY: only this thread writes this cell, and the
+                    // main thread reads it only after popping index 1.
+                    causalities[1].with_mut(|c| unsafe { *c = 1 });
                     test_println!("prev={:#x}", prev)
                 });
             });
@@ -114,6 +114,8 @@ mod test {
                 thread::yield_now();
             }
             let idx = idx.unwrap();
+            // SAFETY: the write to this cell happens-before its index was
+            // pushed (which is what this test checks; loom reports otherwise).
             causalities[idx].with(|val| unsafe {
                 assert_eq!(
                     *val, idx,

@@ -456,21 +456,16 @@ where
 
 impl<T, C: cfg::Config> Drop for Array<T, C> {
     fn drop(&mut self) {
-        // XXX(eliza): this could be `with_mut` if we wanted to impl a wrapper for std atomics to change `get_mut` to `with_mut`...
-        let max = self.max.load(Acquire);
+        // `&mut self` guarantees exclusive access; loom atomics have no
+        // `get_mut`, so relaxed loads are used.
+        let max = self.max.load(Relaxed);
         for shard in &self.shards[0..=max] {
-            // XXX(eliza): this could be `with_mut` if we wanted to impl a wrapper for std atomics to change `get_mut` to `with_mut`...
-            let ptr = shard.0.load(Acquire);
-            if ptr.is_null() {
-                continue;
+            let ptr = shard.0.load(Relaxed);
+            if !ptr.is_null() {
+                // SAFETY: shards are allocated with `Box::into_raw` and only
+                // freed here, when the array is dropped.
+                drop(unsafe { Box::from_raw(ptr) });
             }
-            let shard = unsafe {
-                // Safety: this is the only place where these boxes are
-                // deallocated, and we have exclusive access to the shard array,
-                // because...we are dropping it...
-                Box::from_raw(ptr)
-            };
-            drop(shard)
         }
     }
 }
@@ -479,12 +474,9 @@ impl<T: fmt::Debug, C: cfg::Config> fmt::Debug for Array<T, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let max = self.max.load(Acquire);
         let mut set = f.debug_map();
-        for shard in &self.shards[0..=max] {
-            let ptr = shard.0.load(Acquire);
-            if let Some(shard) = ptr::NonNull::new(ptr) {
-                set.entry(&format_args!("{:p}", ptr), unsafe { shard.as_ref() });
-            } else {
-                set.entry(&format_args!("{:p}", ptr), &());
+        for (idx, shard) in self.shards[0..=max].iter().enumerate() {
+            if let Some(shard) = shard.load(Acquire) {
+                set.entry(&idx, shard);
             }
         }
         set.finish()
@@ -507,17 +499,9 @@ impl<T, C: cfg::Config> Ptr<T, C> {
             test_println!("---> null");
             return None;
         }
-        let track = unsafe {
-            // Safety: The returned reference will have the same lifetime as the
-            // reference to the shard pointer, which (morally, if not actually)
-            // owns the shard. The shard is only deallocated when the shard
-            // array is dropped, and it won't be dropped while this pointer is
-            // borrowed --- and the returned reference has the same lifetime.
-            //
-            // We know that the pointer is not null, because we just
-            // null-checked it immediately prior.
-            &*ptr
-        };
+        // SAFETY: the pointer is non-null, and the shard is only freed when
+        // the array is dropped, which cannot happen while `self` is borrowed.
+        let track = unsafe { &*ptr };
 
         Some(track.get_ref())
     }
