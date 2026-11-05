@@ -189,6 +189,55 @@ generous when configuring the allocation of index bits.
 
 ## Performance
 
+### This fork compared to upstream
+
+Nanoseconds per operation (lower is better), measured with [`compare`](compare)
+at commit `38f7c9b` against upstream `168eae4`, each the median of 5 runs of
+the median of 7 repetitions. Multithreaded results are wall time divided by
+the total number of operations of all threads.
+
+Hardware: AMD EPYC 4345P (Zen 4; 8 cores, 16 threads; 32 MiB L3; one CCD),
+bare metal, Ubuntu 24.04, Rust 1.99.1.
+
+| benchmark | threads | upstream | fork | change |
+|---|---:|---:|---:|---:|
+| `get` | 1 | 9.28 | 7.47 | -20% |
+| `contains` | 1 | 9.30 | 1.61 | -83% |
+| `insert_remove` | 1 | 14.78 | 10.44 | -29% |
+| `insert_take` | 1 | 10.93 | 10.59 | -3% |
+| `unique_iter` | 1 | 0.49 | 0.38 | -22% |
+| `pool_create_clear` | 1 | 21.12 | 10.93 | -48% |
+| `get_hot` | 1 | 14.99 | 7.66 | -49% |
+| `get_hot` | 2 | 37.07 | 17.22 | -54% |
+| `get_hot` | 4 | 44.90 | 17.80 | -60% |
+| `get_hot` | 8 | 50.58 | 18.19 | -64% |
+| `get_hot` | 16 | 55.68 | 20.26 | -64% |
+| `get_spread` | 1 | 14.39 | 7.66 | -47% |
+| `get_spread` | 2 | 12.02 | 10.34 | -14% |
+| `get_spread` | 4 | 8.02 | 4.41 | -45% |
+| `get_spread` | 8 | 4.77 | 2.56 | -46% |
+| `get_spread` | 16 | 2.64 | 1.27 | -52% |
+| `get_interleaved` | 1 | 14.50 | 7.66 | -47% |
+| `get_interleaved` | 2 | 17.08 | 8.92 | -48% |
+| `get_interleaved` | 4 | 8.18 | 6.48 | -21% |
+| `get_interleaved` | 8 | 4.74 | 3.14 | -34% |
+| `get_interleaved` | 16 | 1.77 | 1.28 | -28% |
+| `pool_local` | 1 | 21.37 | 17.13 | -20% |
+| `pool_local` | 2 | 10.82 | 8.64 | -20% |
+| `pool_local` | 4 | 5.44 | 4.36 | -20% |
+| `pool_local` | 8 | 2.78 | 2.25 | -19% |
+| `pool_local` | 16 | 1.73 | 1.50 | -13% |
+| `pool_remote_clear` | 1 | 25.89 | 23.44 | -9% |
+| `pool_remote_clear` | 2 | 14.92 | 13.38 | -10% |
+| `pool_remote_clear` | 4 | 7.46 | 6.70 | -10% |
+| `pool_remote_clear` | 8 | 3.78 | 3.38 | -11% |
+| `pool_remote_clear` | 16 | 2.63 | 2.12 | -19% |
+
+Only this single-CCD CPU was measured; CPUs with several CCDs or sockets,
+where cache lines travel farther between cores, were not.
+
+### Upstream's benchmarks
+
 These graphs were produced by [benchmarks] of the sharded slab implementation,
 using the [`criterion`] crate.
 

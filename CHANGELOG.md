@@ -49,6 +49,8 @@ upstream repository.
 
 *   no dependencies (`lazy_static` is gone, #71); Miri, loom, and 32-bit CI
     (#12, #17).
+*   `compare/` benchmarks git refs of the crate against each other; results
+    against upstream are in the README.
 
 <a name="v0.1.7"></a>
 ### v0.1.7 (2023-10-04)
