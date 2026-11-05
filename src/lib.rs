@@ -379,7 +379,7 @@ impl<T> Slab<T> {
 
     /// Returns a new slab with the provided configuration parameters.
     pub fn new_with_config<C: cfg::Config>() -> Slab<T, C> {
-        C::validate();
+        let () = C::VALIDATE;
         Slab {
             shards: shard::Array::new(),
             _cfg: PhantomData,

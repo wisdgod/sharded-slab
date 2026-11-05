@@ -42,6 +42,42 @@ pub trait Config: Sized {
     /// reserving additional bits will decrease the period of the generation
     /// counter. These should thus be used relatively sparingly, to ensure that
     /// generation counters are able to effectively prevent the ABA problem.
+    ///
+    /// The page address, thread ID, and generation (at least 2 bits) must fit
+    /// in the remaining bits, so reserving many bits requires lowering the
+    /// other limits. An invalid `Config` fails to compile. For example, on a
+    /// 64-bit platform, reserving 32 bits leaves 18 bits for page addresses,
+    /// 6 for thread IDs, and 8 for the generation:
+    ///
+    /// ```
+    /// # #[cfg(target_pointer_width = "64")] {
+    /// use sharded_slab::{Config, Slab};
+    ///
+    /// struct Reserve32;
+    /// impl Config for Reserve32 {
+    ///     const RESERVED_BITS: usize = 32;
+    ///     const MAX_THREADS: usize = 64;
+    ///     const MAX_PAGES: usize = 12;
+    /// }
+    ///
+    /// let slab = Slab::new_with_config::<Reserve32>();
+    /// let key = slab.insert("hello").unwrap();
+    /// assert_eq!(key >> 32, 0);
+    /// # }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # #[cfg(target_pointer_width = "64")] {
+    /// # use sharded_slab::{Config, Slab};
+    /// struct Reserve32;
+    /// impl Config for Reserve32 {
+    ///     const RESERVED_BITS: usize = 32;
+    /// }
+    ///
+    /// let slab = Slab::<()>::new_with_config::<Reserve32>();
+    /// # }
+    /// # #[cfg(not(target_pointer_width = "64"))] compile_error!();
+    /// ```
     const RESERVED_BITS: usize = 0;
 }
 
@@ -51,50 +87,32 @@ pub(crate) trait CfgPrivate: Config {
     const MAX_SHARDS: usize = next_pow2(Self::MAX_THREADS);
     const ADDR_INDEX_SHIFT: usize = Self::INITIAL_SZ.trailing_zeros() as usize + 1;
 
+    /// Evaluating this rejects an invalid `Config` at compile time.
+    const VALIDATE: () = {
+        assert!(
+            Generation::<Self>::SHIFT + Self::RESERVED_BITS + 2 <= WIDTH,
+            "invalid `Config`: the page address, thread ID, and reserved bits \
+             leave fewer than 2 bits of a `usize` for the generation counter; \
+             decrease `MAX_PAGES`, `MAX_THREADS`, `INITIAL_PAGE_SIZE`, or \
+             `RESERVED_BITS`",
+        );
+        assert!(
+            Self::INITIAL_SZ <= Addr::<Self>::BITS,
+            "invalid `Config`: `INITIAL_PAGE_SIZE` is too large",
+        );
+        assert!(
+            RefCount::<Self>::MAX > 1,
+            "invalid `Config`: too few bits are left for reference counts; \
+             decrease `MAX_PAGES`, `MAX_THREADS`, or `INITIAL_PAGE_SIZE`",
+        );
+    };
+
     fn page_size(n: usize) -> usize {
-        Self::INITIAL_SZ * 2usize.pow(n as _)
+        Self::INITIAL_SZ << n
     }
 
     fn debug() -> DebugConfig<Self> {
         DebugConfig { _cfg: PhantomData }
-    }
-
-    fn validate() {
-        assert!(
-            Self::INITIAL_SZ.is_power_of_two(),
-            "invalid Config: {:#?}",
-            Self::debug(),
-        );
-        assert!(
-            Self::INITIAL_SZ <= Addr::<Self>::BITS,
-            "invalid Config: {:#?}",
-            Self::debug()
-        );
-
-        assert!(
-            Generation::<Self>::BITS >= 3,
-            "invalid Config: {:#?}\ngeneration counter should be at least 3 bits!",
-            Self::debug()
-        );
-
-        assert!(
-            Self::USED_BITS <= WIDTH,
-            "invalid Config: {:#?}\ntotal number of bits per index is too large to fit in a word!",
-            Self::debug()
-        );
-
-        assert!(
-            WIDTH - Self::USED_BITS >= Self::RESERVED_BITS,
-            "invalid Config: {:#?}\nindices are too large to fit reserved bits!",
-            Self::debug()
-        );
-
-        assert!(
-            RefCount::<Self>::MAX > 1,
-            "invalid config: {:#?}\n maximum concurrent references would be {}",
-            Self::debug(),
-            RefCount::<Self>::MAX,
-        );
     }
 
     #[inline(always)]
@@ -129,12 +147,13 @@ pub(crate) struct DebugConfig<C: Config> {
     _cfg: PhantomData<fn(C)>,
 }
 
-pub(crate) const WIDTH: usize = std::mem::size_of::<usize>() * 8;
+pub(crate) const WIDTH: usize = usize::BITS as usize;
 
-pub(crate) const fn next_pow2(n: usize) -> usize {
-    let pow2 = n.count_ones() == 1;
-    let zeros = n.leading_zeros();
-    1 << (WIDTH - zeros as usize - pow2 as usize)
+/// The smallest power of two `>= n`, failing to compile if there is none
+/// (hawkw/sharded-slab#115).
+const fn next_pow2(n: usize) -> usize {
+    n.checked_next_power_of_two()
+        .expect("invalid `Config`: value too large to round up to a power of two")
 }
 
 // === impl DefaultConfig ===
@@ -222,17 +241,6 @@ mod tests {
         const INITIAL_PAGE_SIZE: usize = 1;
         const MAX_THREADS: usize = 1;
         const MAX_PAGES: usize = 1;
-    }
-
-    #[test]
-    #[cfg_attr(loom, ignore)]
-    #[should_panic]
-    fn validates_max_refs() {
-        // Configure the slab with a very large number of bits for the generation
-        // counter. This will only leave 1 bit to use for the slot reference
-        // counter, which will fail to validate.
-
-        let _slab = Slab::<usize>::new_with_config::<GiantGenConfig>();
     }
 
     #[test]

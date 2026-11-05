@@ -54,3 +54,27 @@
 //! assert_send::<sharded_slab::Entry<'static, String>>();
 //! assert_send::<sharded_slab::VacantEntry<'static, String>>();
 //! ```
+//!
+//! A `Config` leaving too few bits for reference counts fails to compile,
+//! instead of panicking at runtime:
+//!
+//! ```compile_fail
+//! struct GiantGenConfig;
+//! impl sharded_slab::Config for GiantGenConfig {
+//!     const INITIAL_PAGE_SIZE: usize = 1;
+//!     const MAX_THREADS: usize = 1;
+//!     const MAX_PAGES: usize = 1;
+//! }
+//! let _slab = sharded_slab::Slab::<usize>::new_with_config::<GiantGenConfig>();
+//! ```
+//!
+//! So does a `Config` whose limits cannot be rounded up to a power of two
+//! (hawkw/sharded-slab#115):
+//!
+//! ```compile_fail
+//! struct Huge;
+//! impl sharded_slab::Config for Huge {
+//!     const MAX_THREADS: usize = usize::MAX;
+//! }
+//! let _slab = sharded_slab::Slab::<usize>::new_with_config::<Huge>();
+//! ```

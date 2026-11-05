@@ -95,7 +95,12 @@ impl<C> Copy for Word<C> {}
 impl<C: cfg::Config> Pack<C> for Generation<C> {
     /// Use all the remaining bits in the word for the generation counter, minus
     /// any bits reserved by the user.
-    const LEN: usize = (cfg::WIDTH - C::RESERVED_BITS) - Self::SHIFT;
+    ///
+    /// Saturating, so that an invalid `Config` is reported by
+    /// `CfgPrivate::VALIDATE` instead of an overflow here.
+    const LEN: usize = cfg::WIDTH
+        .saturating_sub(C::RESERVED_BITS)
+        .saturating_sub(Self::SHIFT);
 
     type Prev = Tid<C>;
 
