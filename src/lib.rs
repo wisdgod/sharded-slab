@@ -454,7 +454,7 @@ impl<T, C: cfg::Config> Slab<T, C> {
         let (tid, shard) = self.shards.current()?;
         test_println!("vacant_entry {:?}", tid);
         Some(VacantEntry {
-            inner: shard.init()?,
+            inner: shard.init(shard::Init::ReserveUninit)?,
             _slab: PhantomData,
         })
     }

@@ -252,3 +252,36 @@ fn max_refs() {
     assert!(slab.remove(key));
     assert!(slab.get(key).is_none());
 }
+
+/// A panicking `create_with` discards its slot after clearing the value, so
+/// the slot is reused clean, and its key never becomes valid.
+#[test]
+fn create_with_panic_clears_slot() {
+    let pool: Pool<String> = Pool::new();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.create_with(|s| {
+            s.push_str("dirty");
+            panic!("oops");
+        })
+    }));
+    assert!(panicked.is_err());
+    let item = pool.create().unwrap();
+    assert!(item.is_empty(), "discarded value was not cleared");
+    let key = item.key();
+    drop(item);
+    assert_eq!(addr(key), 0, "the discarded slot is reused first");
+}
+
+/// A discarded `VacantEntry`'s key does not refer to the slot's next value.
+#[test]
+fn discarded_vacant_entry_key_stays_invalid() {
+    let slab = Slab::new();
+    let entry = slab.vacant_entry().unwrap();
+    let stale = entry.key();
+    drop(entry);
+    let key = slab.insert(1).unwrap();
+    assert_eq!(addr(key), addr(stale));
+    assert!(slab.get(stale).is_none());
+    assert!(!slab.remove(stale));
+    assert_eq!(slab.get(key).unwrap(), 1);
+}

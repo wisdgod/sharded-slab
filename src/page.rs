@@ -218,7 +218,11 @@ impl<T, C: cfg::Config> Shared<T, C> {
     /// `None` if the page is full.
     ///
     /// Must be called only on the shard's owning thread.
-    pub(crate) fn init(&self, local: &Local) -> Option<(Addr<C>, slot::Generation<C>)>
+    pub(crate) fn init(
+        &self,
+        local: &Local,
+        exclusive: bool,
+    ) -> Option<(Addr<C>, slot::Generation<C>)>
     where
         T: Default,
     {
@@ -231,7 +235,7 @@ impl<T, C: cfg::Config> Shared<T, C> {
         };
         let slot = &slots[head];
         local.set_head(slot.next());
-        let generation = slot.init();
+        let generation = slot.init(exclusive);
         let addr = Addr::from_usize(head + self.prev_sz);
         test_println!("-> init: {:?} {:?}", addr, generation);
         Some((addr, generation))

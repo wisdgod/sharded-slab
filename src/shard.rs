@@ -87,6 +87,22 @@ pub(crate) struct InitGuard<T: Clear, C: cfg::Config> {
     shard: NonNull<Shard<T, C>>,
     slot: NonNull<Slot<T, C>>,
     key: usize,
+    mode: Init,
+}
+
+/// How a slot is initialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Init {
+    /// The value may be marked for removal before it is published, and is
+    /// removed when published (`Pool::create`, whose `RefMut` exposes the key).
+    /// Costs an extra atomic RMW.
+    Exclusive,
+    /// The value cannot be removed before it is published, and is cleared if
+    /// discarded (`Pool::create_with`).
+    Reserve,
+    /// Like [`Init::Reserve`], but the value is uninitialized until written,
+    /// so it is not cleared if discarded (`Slab`).
+    ReserveUninit,
 }
 
 // === impl Shard ===
@@ -221,19 +237,21 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
     ///
     /// Must be called only on the shard's owning thread. The shard must
     /// outlive the returned guard.
-    pub(crate) fn init(&self) -> Option<InitGuard<T, C>>
+    pub(crate) fn init(&self, mode: Init) -> Option<InitGuard<T, C>>
     where
         T: Default,
     {
+        let exclusive = mode == Init::Exclusive;
         for (page_index, page) in self.shared.iter().enumerate() {
             test_println!("-> page {}; {:?}", page_index, page);
-            if let Some((addr, generation)) = page.init(self.local(page_index)) {
+            if let Some((addr, generation)) = page.init(self.local(page_index), exclusive) {
                 let key = Tid::<C>::new(self.tid).pack(generation.pack(addr.pack(0)));
                 let slot = page.slot(addr).expect("initialized slot must exist");
                 return Some(InitGuard {
                     shard: NonNull::from(self),
                     slot: NonNull::from(slot),
                     key,
+                    mode,
                 });
             }
         }
@@ -357,7 +375,8 @@ impl<T: Clear, C: cfg::Config> InitGuard<T, C> {
     #[inline]
     pub(crate) fn publish(self) {
         let this = ManuallyDrop::new(self);
-        if this.slot().publish(C::unpack_gen(this.key), 0) {
+        let exclusive = this.mode == Init::Exclusive;
+        if this.slot().publish(C::unpack_gen(this.key), 0, exclusive) {
             // SAFETY: the shard outlives the guard, and we claimed the slot.
             unsafe { this.shard.as_ref().free_key(this.key) };
         }
@@ -367,7 +386,8 @@ impl<T: Clear, C: cfg::Config> InitGuard<T, C> {
     #[inline]
     pub(crate) fn downgrade(self) -> Guard<T, C> {
         let this = ManuallyDrop::new(self);
-        let claimed = this.slot().publish(C::unpack_gen(this.key), 1);
+        debug_assert_eq!(this.mode, Init::Exclusive, "only `RefMut`s downgrade");
+        let claimed = this.slot().publish(C::unpack_gen(this.key), 1, true);
         debug_assert!(!claimed, "publishing with a reference never claims");
         Guard {
             shard: this.shard,
@@ -379,13 +399,17 @@ impl<T: Clear, C: cfg::Config> InitGuard<T, C> {
 
 impl<T: Clear, C: cfg::Config> Drop for InitGuard<T, C> {
     fn drop(&mut self) {
-        self.slot().discard(C::unpack_gen(self.key));
-        // The value was never published, so it is not cleared: a `Slab`'s is
-        // uninitialized, and a `Pool`'s (which never discards) stays valid.
+        self.slot()
+            .discard(C::unpack_gen(self.key), self.mode == Init::Exclusive);
         // SAFETY: the shard outlives the guard.
         let shard = unsafe { self.shard.as_ref() };
-        let (page_index, _) = shard.slot(self.key).expect("claimed slot must exist");
-        shard.push_free(self.key, page_index, self.slot());
+        let (page_index, slot) = shard.slot(self.key).expect("claimed slot must exist");
+        if self.mode != Init::ReserveUninit {
+            // SAFETY: we claimed the slot, and a `Pool` value is always
+            // initialized (if possibly modified by a panicking `create_with`).
+            unsafe { slot.clear() };
+        }
+        shard.push_free(self.key, page_index, slot);
     }
 }
 

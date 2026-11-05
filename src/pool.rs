@@ -458,7 +458,7 @@ where
         let (tid, shard) = self.shards.current()?;
         test_println!("pool: create {:?}", tid);
         Some(RefMut {
-            inner: ManuallyDrop::new(shard.init()?),
+            inner: ManuallyDrop::new(shard.init(shard::Init::Exclusive)?),
             _pool: PhantomData,
         })
     }
@@ -620,7 +620,7 @@ where
     pub fn create_owned(self: Arc<Self>) -> Option<OwnedRefMut<T, C>> {
         let (tid, shard) = self.shards.current()?;
         test_println!("pool: create_owned {:?}", tid);
-        let inner = ManuallyDrop::new(shard.init()?);
+        let inner = ManuallyDrop::new(shard.init(shard::Init::Exclusive)?);
         Some(OwnedRefMut { inner, pool: self })
     }
 
@@ -647,10 +647,15 @@ where
     /// }).join().unwrap();
     /// ```
     pub fn create_with(&self, init: impl FnOnce(&mut T)) -> Option<usize> {
-        test_println!("pool: create_with");
-        let mut guard = self.create()?;
-        init(&mut guard);
-        Some(guard.key())
+        let (tid, shard) = self.shards.current()?;
+        test_println!("pool: create_with {:?}", tid);
+        // The key is not handed out before the value is published, so it
+        // cannot be cleared meanwhile, and the slot needs no exclusive state.
+        let mut guard = shard.init(shard::Init::Reserve)?;
+        init(guard.value_mut());
+        let key = guard.key();
+        guard.publish();
+        Some(key)
     }
 
     /// Return a borrowed reference to the value associated with the given key.

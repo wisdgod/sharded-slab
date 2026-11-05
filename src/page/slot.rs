@@ -32,10 +32,14 @@
 //!   exclusively held values exist), `Exclusive(g)` → `ExclusiveMarked`
 //! - `claim` (blocking `take`): `Present(g, r)` / `Marked(g, r)` →
 //!   `Vacant(g + 1, r)`, then wait for `r` to drain to zero
-//! - `init`: `Vacant(g)` → `Exclusive(g)`
+//! - `init`: `Vacant(g)` → `Exclusive(g)` if the value may be removed before
+//!   it is published (`Pool::create`); otherwise the slot stays `Vacant(g)`,
+//!   reserved by the thread that popped it from the free list
 //! - `publish`: `Exclusive(g)` → `Present(g)`; `ExclusiveMarked(g)` →
-//!   `Vacant(g + 1)` (claimed), or for a downgrade, → `Marked(g, r + 1)`
-//! - `discard`: `Exclusive(g)` / `ExclusiveMarked(g)` → `Vacant(g + 1)`
+//!   `Vacant(g + 1)` (claimed), or for a downgrade, → `Marked(g, r + 1)`;
+//!   a reserved `Vacant(g)` → `Present(g)`
+//! - `discard`: `Exclusive(g)` / `ExclusiveMarked(g)` / reserved `Vacant(g)`
+//!   → `Vacant(g + 1)`
 use crate::sync::{
     UnsafeCell,
     atomic::{AtomicUsize, Ordering::*},
@@ -415,8 +419,21 @@ impl<T, C: cfg::Config> Slot<T, C> {
 
     /// Starts exclusive access to a slot just popped from a free list,
     /// returning the generation of the new value.
+    ///
+    /// Unless `exclusive`, the slot stays `Vacant` until it is published, so
+    /// that removal cannot be requested meanwhile and no atomic RMW is needed
+    /// here.
     #[inline]
-    pub(super) fn init(&self) -> Generation<C> {
+    pub(super) fn init(&self, exclusive: bool) -> Generation<C> {
+        if !exclusive {
+            let word = self.load(Relaxed);
+            debug_assert_eq!(
+                word.state,
+                State::Vacant,
+                "initialized a slot that is not on a free list: {word:?}"
+            );
+            return word.generation;
+        }
         // Only speculative `get`s can modify a slot on a free list, and only
         // its reference count, which must be preserved. The item itself is
         // synchronized by the free list, so no ordering is needed here.
@@ -436,7 +453,18 @@ impl<T, C: cfg::Config> Slot<T, C> {
     /// the caller claimed it, and must now clear and free it. That never
     /// happens for `refs > 0`, where the slot stays marked and the last
     /// reference claims it.
-    pub(crate) fn publish(&self, generation: Generation<C>, refs: usize) -> bool {
+    pub(crate) fn publish(&self, generation: Generation<C>, refs: usize, exclusive: bool) -> bool {
+        if !exclusive {
+            debug_assert_eq!(refs, 0, "only exclusive access can be downgraded");
+            // `Vacant` → `Present`, preserving speculative references.
+            let delta = State::Vacant as usize ^ State::Present as usize;
+            let _prev = Word::<C>::unpack(self.lifecycle.fetch_xor(delta, Release));
+            debug_assert!(
+                _prev.state == State::Vacant && _prev.generation == generation,
+                "reserved slot changed: {_prev:?}"
+            );
+            return false;
+        }
         let prev = self.update(|word| {
             debug_assert!(
                 word.generation == generation
@@ -458,7 +486,23 @@ impl<T, C: cfg::Config> Slot<T, C> {
 
     /// Ends exclusive access without publishing the value, claiming the slot.
     /// The caller must now clear and free it.
-    pub(crate) fn discard(&self, generation: Generation<C>) {
+    pub(crate) fn discard(&self, generation: Generation<C>, exclusive: bool) {
+        if !exclusive {
+            // Still `Vacant`: only advance the generation, so that the key
+            // handed out for it (by a `VacantEntry`) never refers to the slot's
+            // next value. The generation is the top field of the word, so
+            // adding to it wraps around without disturbing the other fields.
+            const {
+                assert!(LifecycleGen::<C>::SHIFT + LifecycleGen::<C>::LEN == cfg::WIDTH);
+            }
+            let one = 1 << LifecycleGen::<C>::SHIFT;
+            let _prev = Word::<C>::unpack(self.lifecycle.fetch_add(one, Relaxed));
+            debug_assert!(
+                _prev.state == State::Vacant && _prev.generation == generation,
+                "reserved slot changed: {_prev:?}"
+            );
+            return;
+        }
         let _ = self.update(|word| {
             debug_assert!(
                 word.generation == generation
