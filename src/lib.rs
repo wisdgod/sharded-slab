@@ -684,6 +684,32 @@ impl<T, C: cfg::Config> Slab<T, C> {
         })
     }
 
+    /// Returns a mutable reference to the value associated with the given key.
+    ///
+    /// Since this borrows the slab mutably, no other thread can access it, so
+    /// no synchronization is needed. This is useful when phases of concurrent
+    /// access through `&Slab` alternate with exclusive phases (for example, a
+    /// slab in an `RwLock`).
+    ///
+    /// If the slab does not contain a value for the given key, `None` is
+    /// returned instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut slab = sharded_slab::Slab::new();
+    /// let key = slab.insert(String::from("hello world")).unwrap();
+    /// slab.get_mut(key).unwrap().push('!');
+    ///
+    /// assert_eq!(*slab.get(key).unwrap(), "hello world!");
+    /// assert!(slab.get_mut(key + 1).is_none());
+    /// ```
+    pub fn get_mut(&mut self, key: usize) -> Option<&mut T> {
+        self.shards
+            .get_mut(C::unpack_tid(key).as_usize())?
+            .get_mut(key)
+    }
+
     /// Returns `true` if the slab contains a value for the given key.
     ///
     /// # Examples
@@ -807,6 +833,17 @@ impl<T, C: cfg::Config> Entry<'_, T, C> {
     }
 }
 
+/// Cloning an entry is as cheap as `Arc::clone`, and keeps the value accessible.
+impl<T, C: cfg::Config> Clone for Entry<'_, T, C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            value: self.value,
+            _slab: PhantomData,
+        }
+    }
+}
+
 impl<T, C: cfg::Config> Deref for Entry<'_, T, C> {
     type Target = T;
 
@@ -914,6 +951,17 @@ where
         // SAFETY: `value` points into the slot that `inner` keeps referenced;
         // it is cached to avoid unwrapping the `Option` on every access.
         unsafe { self.value.as_ref() }
+    }
+}
+
+/// Cloning an entry is as cheap as `Arc::clone`, and keeps the value accessible.
+impl<T, C: cfg::Config> Clone for OwnedEntry<T, C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            value: self.value,
+            _slab: self._slab.clone(),
+        }
     }
 }
 

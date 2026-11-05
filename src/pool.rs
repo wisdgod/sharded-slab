@@ -890,6 +890,17 @@ where
     }
 }
 
+/// Cloning a reference is as cheap as `Arc::clone`, and keeps the value
+/// accessible.
+impl<T: Clear + Default, C: cfg::Config> Clone for Ref<'_, T, C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _pool: PhantomData,
+        }
+    }
+}
+
 impl<T, C> Deref for Ref<'_, T, C>
 where
     T: Clear + Default,
@@ -1054,6 +1065,17 @@ where
     #[inline]
     fn value(&self) -> &T {
         self.inner.value()
+    }
+}
+
+/// Cloning a reference is as cheap as `Arc::clone`, and keeps the value
+/// accessible.
+impl<T: Clear + Default, C: cfg::Config> Clone for OwnedRef<T, C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _pool: self._pool.clone(),
+        }
     }
 }
 

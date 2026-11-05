@@ -139,3 +139,45 @@ fn generation_wraps_at_field_width() {
     let first = Generation::<DefaultConfig>::from_usize(0);
     assert_eq!(first.advance(), Generation::from_usize(1));
 }
+
+/// Cloned guards keep a removed value alive until the last clone is dropped
+/// (hawkw/sharded-slab#38).
+#[test]
+fn cloned_entries_defer_removal() {
+    let slab = Slab::new();
+    let key = slab.insert(String::from("hi")).unwrap();
+    let a = slab.get(key).unwrap();
+    let b = a.clone();
+    assert!(slab.remove(key));
+    assert!(slab.get(key).is_none());
+    drop(a);
+    assert_eq!(*b, "hi");
+    drop(b);
+    assert_eq!(addr(slab.insert(String::new()).unwrap()), addr(key));
+
+    let pool: Pool<String> = Pool::new();
+    let key = pool.create_with(|s| s.push('x')).unwrap();
+    let a = pool.get(key).unwrap();
+    let b = a.clone();
+    assert!(pool.clear(key));
+    drop(a);
+    assert_eq!(*b, "x");
+    drop(b);
+    assert!(pool.create().unwrap().is_empty());
+}
+
+/// `get_mut` only reaches present values (hawkw/sharded-slab#97).
+#[test]
+fn get_mut() {
+    let mut slab = Slab::new();
+    let key = slab.insert(1).unwrap();
+    *slab.get_mut(key).unwrap() += 1;
+    assert_eq!(slab.get(key).unwrap(), 2);
+    assert!(slab.get_mut(next_generation(key)).is_none());
+    slab.take(key);
+    assert!(slab.get_mut(key).is_none());
+    let entry = slab.vacant_entry().unwrap();
+    let key = entry.key();
+    drop(entry);
+    assert!(slab.get_mut(key).is_none());
+}

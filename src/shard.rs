@@ -233,6 +233,16 @@ impl<T: Clear, C: cfg::Config> Shard<T, C> {
 }
 
 impl<T, C: cfg::Config> Shard<Option<T>, C> {
+    /// Returns a mutable reference to the value at `key`.
+    pub(crate) fn get_mut(&mut self, key: usize) -> Option<&mut T> {
+        let (_, slot) = self.slot(key)?;
+        if !slot.is_present(C::unpack_gen(key)) {
+            return None;
+        }
+        // SAFETY: `&mut self` guarantees that no guard to the slot exists.
+        unsafe { slot.item_mut() }.as_mut()
+    }
+
     /// Removes and returns the value at `key`, waiting for outstanding
     /// references to it to be released.
     pub(crate) fn take(&self, key: usize) -> Option<T> {
@@ -399,6 +409,14 @@ where
         self.shards.get(idx)?.load(Acquire)
     }
 
+    #[inline]
+    pub(crate) fn get_mut(&mut self, idx: usize) -> Option<&mut Shard<T, C>> {
+        let ptr = self.shards.get(idx)?.0.load(Relaxed);
+        // SAFETY: a non-null pointer is a live shard owned by the array, and
+        // `&mut self` guarantees exclusive access to it.
+        Some(unsafe { ptr.as_mut()? }.get_mut())
+    }
+
     /// Returns the calling thread's shard, allocating it if needed.
     ///
     /// Returns `None` if the thread cannot have a shard: its ID exceeds the
@@ -535,4 +553,10 @@ where
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.0.size_hint().1)
+    }
 }
+
+impl<T, C: cfg::Config> std::iter::FusedIterator for IterMut<'_, T, C> {}
