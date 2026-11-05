@@ -83,8 +83,11 @@ fn double_get() {
 #[cfg_attr(miri, ignore)]
 fn reserved_bits_reuse_slots() {
     struct ReservedConfig;
+    // One page fewer than the default, so that the reserved bit still leaves
+    // a valid generation counter on 32-bit platforms.
     impl Config for ReservedConfig {
         const RESERVED_BITS: usize = 1;
+        const MAX_PAGES: usize = crate::DefaultConfig::MAX_PAGES - 1;
     }
 
     let slab = Slab::new_with_config::<ReservedConfig>();
