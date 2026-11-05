@@ -502,6 +502,7 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// assert!(!slab.contains(key));
     /// ```
     /// [`take`]: Slab::take
+    #[inline(always)]
     pub fn remove(&self, idx: usize) -> bool {
         // If the value is still referenced, it is removed when the last
         // `Entry` referencing it is dropped. A `VacantEntry` holds no value

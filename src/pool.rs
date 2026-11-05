@@ -810,6 +810,7 @@ where
     /// assert_eq!(pool.clear(key), false);
     /// ```
     /// [`clear`]: #method.clear
+    #[inline]
     pub fn clear(&self, key: usize) -> bool {
         self.shards
             .get(C::unpack_tid(key).as_usize())
