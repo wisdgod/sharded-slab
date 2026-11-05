@@ -24,6 +24,8 @@ upstream repository.
     leaking it (#56); reference count underflow after `RefMut::downgrade` (#55);
     a leaked slot when a `VacantEntry` is dropped without inserting.
 *   generation counters wrap at their full width.
+*   configurations with small pages no longer starve the reference count of
+    bits: the generation counter is capped so that it keeps at least 16.
 
 #### Features
 
@@ -33,8 +35,14 @@ upstream repository.
 
 #### Performance
 
-*   `contains` is a single atomic load; `insert`/`remove`, `unique_iter`, and
-    `Pool::create`/`clear` are faster; releasing guards and removing values no
+*   `get` and guard release use `fetch_add`/`fetch_sub` instead of CAS loops,
+    so many threads accessing the same value no longer retry each other's
+    updates.
+*   `Slab` values are stored in `MaybeUninit` instead of `Option`: the slot
+    lifecycle already tracks whether a value is present.
+*   `Slab::insert`, `VacantEntry`, and `Pool::create_with` publish a value with
+    a single atomic operation.
+*   `contains` is a single atomic load; releasing guards and removing values no
     longer register the calling thread.
 
 #### Other
