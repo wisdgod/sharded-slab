@@ -731,12 +731,14 @@ impl<T, C: cfg::Config> Slab<T, C> {
         let guard = self.shards.get(C::unpack_tid(key).as_usize())?.get(key)?;
         // A published `Slab` slot always holds `Some`, since only
         // `VacantEntry::insert` publishes values.
-        let value = NonNull::from(
-            guard
-                .value()
-                .as_ref()
-                .expect("published slot must have a value"),
-        );
+        //
+        // This must not be a panicking `expect`: unwinding while `guard` is
+        // live forces it to be spilled to the stack, and the stores then delay
+        // the `lock cmpxchg` releasing it, doubling the cost of `get`.
+        let value = guard.value();
+        debug_assert!(value.is_some(), "published slot must have a value");
+        // SAFETY: as above, a published slot always holds `Some`.
+        let value = NonNull::from(unsafe { value.as_ref().unwrap_unchecked() });
         Some((guard, value))
     }
 }
