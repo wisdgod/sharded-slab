@@ -66,6 +66,21 @@ pub(crate) struct Array<T, C: cfg::Config> {
 #[derive(Debug)]
 struct Ptr<T, C: cfg::Config>(AtomicPtr<alloc::Track<Shard<T, C>>>);
 
+/// An iterator over the values present in an [`Array`] that only borrows it,
+/// acquiring a [`Guard`] for each; see `Slab::iter`.
+///
+/// Only the position is kept between calls. A shard and a page's slots are
+/// borrowed within one call to `next`, which scans a page's vacant slots
+/// without reloading anything: keeping such borrows in the iterator would
+/// make it `!Send` and `!Sync` through their `UnsafeCell`s.
+pub(crate) struct Iter<'a, T, C: cfg::Config> {
+    array: &'a Array<T, C>,
+    /// The position of the next slot to visit.
+    shard: usize,
+    page: usize,
+    offset: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct IterMut<'a, T: 'a, C: cfg::Config + 'a>(slice::IterMut<'a, Ptr<T, C>>);
 
@@ -507,6 +522,15 @@ where
         test_println!("-> highest index={}", max);
         IterMut(self.shards[0..=max].iter_mut())
     }
+
+    pub(crate) fn iter(&self) -> Iter<'_, T, C> {
+        Iter {
+            array: self,
+            shard: 0,
+            page: 0,
+            offset: 0,
+        }
+    }
 }
 
 impl<T, C: cfg::Config> Drop for Array<T, C> {
@@ -599,3 +623,66 @@ where
 }
 
 impl<T, C: cfg::Config> std::iter::FusedIterator for IterMut<'_, T, C> {}
+
+impl<T, C: cfg::Config> Iter<'_, T, C> {
+    /// Moves to the start of the next shard.
+    fn next_shard(&mut self) {
+        self.shard += 1;
+        self.page = 0;
+        self.offset = 0;
+    }
+
+    /// Moves to the start of the current shard's next page.
+    fn next_page(&mut self) {
+        self.page += 1;
+        self.offset = 0;
+    }
+}
+
+impl<T: Clear, C: cfg::Config> Iterator for Iter<'_, T, C> {
+    type Item = Guard<T, C>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        test_println!("Iter::next");
+        loop {
+            // Shards are only ever added, so re-reading `max` also visits the
+            // ones allocated after the iteration started.
+            if self.shard > self.array.max.load(Acquire) {
+                // Fuse: `max` is below `usize::MAX`, whatever it grows to.
+                self.shard = usize::MAX;
+                return None;
+            }
+            let Some(shard) = self.array.get(self.shard) else {
+                self.next_shard();
+                continue;
+            };
+            let Some(page) = shard.shared.get(self.page) else {
+                self.next_shard();
+                continue;
+            };
+            let Some((first, slots)) = page.allocated() else {
+                self.next_page();
+                continue;
+            };
+            while let Some(slot) = slots.get(self.offset) {
+                let addr = page::Addr::<C>::from_usize(first + self.offset);
+                self.offset += 1;
+                // The snapshot only locates a candidate: `get` validates the
+                // generation while acquiring the reference, so a value removed
+                // or replaced meanwhile is skipped, exactly as a lookup by key
+                // would skip it.
+                let Some(generation) = slot.present_generation() else {
+                    continue;
+                };
+                let key = Tid::<C>::new(shard.tid).pack(generation.pack(addr.pack(0)));
+                test_println!("-> candidate {:#x}", key);
+                if let Some(guard) = shard.get(key) {
+                    return Some(guard);
+                }
+            }
+            self.next_page();
+        }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> std::iter::FusedIterator for Iter<'_, T, C> {}

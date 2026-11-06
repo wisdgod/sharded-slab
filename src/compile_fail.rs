@@ -45,6 +45,23 @@
 //! assert_send::<sharded_slab::Entry<'static, std::sync::MutexGuard<'static, ()>>>();
 //! ```
 //!
+//! An `Iter` over a slab of a `!Sync` type is not `Send`, since it acquires
+//! guards, and so accesses the slab, on whichever thread it runs on:
+//!
+//! ```compile_fail
+//! fn assert_send<T: Send>() {}
+//! assert_send::<sharded_slab::Iter<'static, std::cell::Cell<u8>>>();
+//! ```
+//!
+//! while an `Iter` over a slab that may be shared is `Send` and `Sync`:
+//!
+//! ```
+//! fn assert_send<T: Send>() {}
+//! fn assert_sync<T: Sync>() {}
+//! assert_send::<sharded_slab::Iter<'static, String>>();
+//! assert_sync::<sharded_slab::Iter<'static, String>>();
+//! ```
+//!
 //! Pool guards of `Send + Sync` values are `Send` (hawkw/sharded-slab#43):
 //!
 //! ```

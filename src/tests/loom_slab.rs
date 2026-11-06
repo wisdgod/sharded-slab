@@ -781,3 +781,62 @@ fn take_waits_for_remote_entry() {
         t1.join().unwrap();
     });
 }
+
+/// `iter` races with removing a value and inserting another into its shard:
+/// the insertion reuses the removed value's slot (freed locally, or remotely
+/// by the iterator's guard) or allocates the next page. Values present
+/// throughout are yielded once, and each yielded entry is a value under its
+/// own key.
+#[test]
+fn iter_races_with_remove_and_insert() {
+    run_model("iter_races_with_remove_and_insert", || {
+        let slab = Arc::new(Slab::new_with_config::<TinyConfig>());
+        let stable = slab.insert(1).unwrap();
+        let doomed = slab.insert(2).unwrap();
+        // Fill the first page (of 4 slots).
+        let fillers = [slab.insert(4).unwrap(), slab.insert(5).unwrap()];
+
+        let s = slab.clone();
+        let t = thread::spawn(move || s.iter().map(|e| (e.key(), *e)).collect::<Vec<_>>());
+
+        assert!(slab.remove(doomed));
+        let fresh = slab.insert(3).unwrap();
+        let seen = t.join().unwrap();
+
+        for key in [stable, fillers[0], fillers[1]] {
+            assert_eq!(seen.iter().filter(|(k, _)| *k == key).count(), 1);
+        }
+        for &(key, value) in &seen {
+            let expected = match value {
+                1 => stable,
+                2 => doomed,
+                3 => fresh,
+                4 => fillers[0],
+                5 => fillers[1],
+                _ => unreachable!("yielded a value that was never inserted"),
+            };
+            assert_eq!(key, expected);
+        }
+        let mut keys: Vec<usize> = seen.iter().map(|&(key, _)| key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), seen.len(), "a key was yielded twice");
+        assert!(slab.get(doomed).is_none());
+        assert_eq!(slab.get(fresh).unwrap(), 3);
+    });
+}
+
+/// `iter` races with another thread's first insertion, which allocates that
+/// thread's shard and its first page (cf. hawkw/sharded-slab#116).
+#[test]
+fn iter_races_with_shard_and_page_allocation() {
+    run_model("iter_races_with_shard_and_page_allocation", || {
+        let slab = Arc::new(Slab::new_with_config::<TinyConfig>());
+        let s = slab.clone();
+        let t = thread::spawn(move || s.insert(1).unwrap());
+        let seen: Vec<(usize, usize)> = slab.iter().map(|e| (e.key(), *e)).collect();
+        let key = t.join().unwrap();
+        assert!(seen.is_empty() || seen == [(key, 1)], "{seen:?}");
+        assert_eq!(slab.get(key).unwrap(), 1);
+    });
+}

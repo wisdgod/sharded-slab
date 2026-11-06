@@ -175,6 +175,13 @@ impl<T, C: cfg::Config> Shared<T, C> {
         self.slots()?.get(self.offset(addr))
     }
 
+    /// The address of the page's first slot, and its slots, if the page is
+    /// allocated. They stay valid as long as the page.
+    #[inline]
+    pub(crate) fn allocated(&self) -> Option<(usize, &[Slot<T, C>])> {
+        Some((self.prev_sz, self.slots()?))
+    }
+
     /// The offset of `addr` (which must be on this page) within the page.
     #[inline(always)]
     pub(crate) fn offset(&self, addr: Addr<C>) -> usize {

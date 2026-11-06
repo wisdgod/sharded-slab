@@ -4,6 +4,7 @@
 //! * The slab doesn't produce overlapping keys.
 //! * The slab doesn't leave "lost" keys.
 //! * `get()`, `get_owned`, and `contains()` are consistent.
+//! * `iter()` yields exactly the active entries, each once, with their keys.
 //! * `RESERVED_BITS` are actually not used.
 //!
 //! The test is supposed to be deterministic, so it doesn't spawn real threads
@@ -37,6 +38,7 @@ enum ActionKind {
     TakeExistent(usize),   // seed
     GetRandom(usize),      // key
     GetExistent(usize),    // seed
+    Iter,
 }
 
 prop_compose! {
@@ -56,6 +58,7 @@ fn action_kind_strategy() -> impl Strategy<Value = ActionKind> {
         // Produce `GetRandom` and `GetExistent` more often.
         5 => prop::num::usize::ANY.prop_map(ActionKind::GetRandom),
         5 => prop::num::usize::ANY.prop_map(ActionKind::GetExistent),
+        1 => Just(ActionKind::Iter),
     ]
 }
 
@@ -177,6 +180,13 @@ fn apply_action<C: Config>(
                 prop_assert_eq!(slab.get(key).map(|e| *e), Some(value));
                 prop_assert_eq!(slab.clone().get_owned(key).map(|e| *e), Some(value));
             }
+        }
+        ActionKind::Iter => {
+            let mut actual = slab.iter().map(|e| (e.key(), *e)).collect::<Vec<_>>();
+            actual.sort();
+            let mut expected = active.map.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+            expected.sort();
+            prop_assert_eq!(actual, expected);
         }
     }
 

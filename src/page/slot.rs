@@ -290,6 +290,20 @@ impl<T, C: cfg::Config> Slot<T, C> {
         word.generation == generation && word.state == State::Present
     }
 
+    /// Returns the generation of the value present in the slot, if any.
+    ///
+    /// Only a snapshot, which grants no access: the value may be removed, and
+    /// the slot reused, at any time. A reference is acquired by [`Slot::get`],
+    /// whose `Acquire` RMW validates the state and the generation itself, so
+    /// the snapshot needs no ordering of its own. (The lifecycle being one
+    /// atomic, `get` cannot observe it older than the snapshot did, which only
+    /// makes the snapshot a good candidate.)
+    #[inline]
+    pub(crate) fn present_generation(&self) -> Option<Generation<C>> {
+        let word = self.load(Relaxed);
+        (word.state == State::Present).then_some(word.generation)
+    }
+
     /// Acquires a shared reference to the slot's value at `generation`.
     ///
     /// The reference count is incremented speculatively, whatever the state,

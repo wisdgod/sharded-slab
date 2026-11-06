@@ -218,7 +218,7 @@ mod tid;
 pub use self::{
     cfg::{Config, DefaultConfig},
     clear::Clear,
-    iter::UniqueIter,
+    iter::{Iter, UniqueIter},
 };
 #[doc(inline)]
 pub use pool::Pool;
@@ -753,6 +753,72 @@ impl<T, C: cfg::Config> Slab<T, C> {
             shards,
             pages,
             slots,
+        }
+    }
+
+    /// Returns an iterator over the values in the slab that only borrows it,
+    /// so values may be inserted and removed while it runs.
+    ///
+    /// Each value is yielded as an [`Entry`], which defers the value's
+    /// removal until it is dropped, just like one returned by [`get`].
+    ///
+    /// The iteration is weakly consistent: every value that is in the slab
+    /// for the whole iteration is yielded exactly once, while a value
+    /// inserted or removed during the iteration may or may not be yielded.
+    /// The order is unspecified.
+    ///
+    /// A value is acquired as [`get`] acquires it, with the same limit: a
+    /// value that already has the maximum number of concurrent references
+    /// (which depends on the [`Config`]) is skipped, as `get` would return
+    /// `None` for it.
+    ///
+    /// Use [`unique_iter`] instead when the slab can be borrowed mutably: it
+    /// sees a consistent snapshot without acquiring any guards.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use sharded_slab::Slab;
+    /// let slab = Slab::new();
+    /// let a = slab.insert("a").unwrap();
+    /// let b = slab.insert("b").unwrap();
+    /// let c = slab.insert("c").unwrap();
+    /// slab.remove(b);
+    ///
+    /// let mut keys: Vec<usize> = slab.iter().map(|entry| entry.key()).collect();
+    /// keys.sort();
+    /// let mut expected = vec![a, c];
+    /// expected.sort();
+    /// assert_eq!(keys, expected);
+    /// ```
+    ///
+    /// Removing values while iterating, through a shared reference:
+    ///
+    /// ```
+    /// # use sharded_slab::Slab;
+    /// let slab = Slab::new();
+    /// for i in 0..10 {
+    ///     slab.insert(i).unwrap();
+    /// }
+    ///
+    /// for entry in slab.iter() {
+    ///     if *entry % 2 == 1 {
+    ///         // Deferred until `entry` is dropped.
+    ///         slab.remove(entry.key());
+    ///     }
+    /// }
+    ///
+    /// let mut left: Vec<i32> = slab.iter().map(|entry| *entry).collect();
+    /// left.sort();
+    /// assert_eq!(left, [0, 2, 4, 6, 8]);
+    /// ```
+    ///
+    /// [`get`]: Slab::get
+    /// [`unique_iter`]: Slab::unique_iter
+    pub fn iter(&self) -> Iter<'_, T, C> {
+        Iter {
+            inner: self.shards.iter(),
+            _slab: PhantomData,
         }
     }
 

@@ -32,6 +32,10 @@ upstream repository.
 *   `Slab::get_mut` (#97).
 *   `Clone` for `Entry`, `OwnedEntry`, `pool::Ref`, `pool::OwnedRef` (#38).
 *   borrowed pool guards are `Send` (#43).
+*   `Slab::iter`: iterates through `&Slab`, while values are inserted and
+    removed concurrently. Weakly consistent: every value present for the whole
+    iteration is yielded exactly once (within the reference limit of `get`),
+    as an `Entry` guard.
 
 #### Performance
 
