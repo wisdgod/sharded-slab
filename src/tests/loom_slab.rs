@@ -840,3 +840,42 @@ fn iter_races_with_shard_and_page_allocation() {
         assert_eq!(slab.get(key).unwrap(), 1);
     });
 }
+
+/// The guarantee `iter` documents for `SeqCst` fences: one thread inserts,
+/// fences, then reads a flag; the other sets the flag, fences, then iterates.
+/// In every interleaving, one of them sees the other.
+#[test]
+fn insert_and_iter_meet_across_seqcst_fences() {
+    insert_and_iter("insert_and_iter_meet_across_seqcst_fences", true);
+}
+
+/// The control: without the fences, loom finds the interleaving where neither
+/// side sees the other, so the model above does exercise the race.
+#[test]
+#[should_panic(expected = "neither side saw the other")]
+fn insert_and_iter_miss_without_fences() {
+    insert_and_iter("insert_and_iter_miss_without_fences", false);
+}
+
+fn insert_and_iter(name: &'static str, fenced: bool) {
+    use loom::sync::atomic::{AtomicBool, fence};
+    run_model(name, move || {
+        let slab = loom::sync::Arc::new(Slab::new_with_config::<TinyConfig>());
+        let flag = loom::sync::Arc::new(AtomicBool::new(false));
+        let (s, f) = (slab.clone(), flag.clone());
+        let inserter = thread::spawn(move || {
+            s.insert(1).unwrap();
+            if fenced {
+                fence(Ordering::SeqCst);
+            }
+            f.load(Ordering::Relaxed)
+        });
+        flag.store(true, Ordering::Relaxed);
+        if fenced {
+            fence(Ordering::SeqCst);
+        }
+        let seen = slab.iter().count();
+        let saw_flag = inserter.join().unwrap();
+        assert!(seen == 1 || saw_flag, "neither side saw the other");
+    });
+}

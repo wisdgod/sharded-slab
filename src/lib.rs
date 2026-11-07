@@ -767,6 +767,18 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// inserted or removed during the iteration may or may not be yielded.
     /// The order is unspecified.
     ///
+    /// An insertion and an iteration racing on two threads are ordered by
+    /// `SeqCst` fences: if one thread inserts a value and then runs
+    /// [`fence`]`(SeqCst)`, and the other runs `fence(SeqCst)` and then
+    /// iterates, either the iteration yields the value (unless it is removed
+    /// meanwhile), or the inserting thread's atomic loads after its fence
+    /// observe the iterating thread's atomic stores before its own. An
+    /// iteration finds values through atomics alone (the number of shards,
+    /// the shard and page pointers, and each slot's state), so this is the
+    /// memory model's rule for `SeqCst` fences, whatever orderings the slab
+    /// uses inside: a flag set before iterating and checked after inserting
+    /// reaches every value, by one side or the other.
+    ///
     /// A value is acquired as [`get`] acquires it, with the same limit: a
     /// value that already has the maximum number of concurrent references
     /// (which depends on the [`Config`]) is skipped, as `get` would return
@@ -814,6 +826,7 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// ```
     ///
     /// [`get`]: Slab::get
+    /// [`fence`]: std::sync::atomic::fence
     /// [`unique_iter`]: Slab::unique_iter
     pub fn iter(&self) -> Iter<'_, T, C> {
         Iter {
