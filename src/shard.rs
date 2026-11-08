@@ -378,6 +378,80 @@ impl<T: Clear, C: cfg::Config> fmt::Debug for Guard<T, C> {
     }
 }
 
+/// A shared reference to a slot's value, like [`Guard`] without the shard
+/// pointer, for owners of the whole slab or pool: the shard is found from
+/// the key when the last reference to a removed value is released, which
+/// happens once per value.
+pub(crate) struct SlotRef<T: Clear, C: cfg::Config> {
+    slot: NonNull<Slot<T, C>>,
+    key: usize,
+}
+
+impl<T: Clear, C: cfg::Config> Guard<T, C> {
+    /// The same reference, without the shard pointer; see [`SlotRef`].
+    pub(crate) fn into_slot_ref(self) -> SlotRef<T, C> {
+        let this = ManuallyDrop::new(self);
+        SlotRef {
+            slot: this.slot,
+            key: this.key,
+        }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> SlotRef<T, C> {
+    #[inline(always)]
+    pub(crate) fn key(&self) -> usize {
+        self.key
+    }
+
+    #[inline(always)]
+    fn slot(&self) -> &Slot<T, C> {
+        // SAFETY: the array holding the slot outlives the reference; see
+        // [`SlotRef::release`].
+        unsafe { self.slot.as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn value(&self) -> &T {
+        // SAFETY: we hold a reference to the slot.
+        unsafe { self.slot().item() }
+    }
+
+    pub(crate) fn clone_ref(&self) -> Self {
+        self.slot().clone_ref();
+        Self {
+            slot: self.slot,
+            key: self.key,
+        }
+    }
+
+    /// Releases the reference, freeing the slot if it was the last one to a
+    /// removed value.
+    ///
+    /// # Safety
+    ///
+    /// `shards` is the array holding the slot, it is alive, and the reference
+    /// is not used again.
+    pub(crate) unsafe fn release(&self, shards: &Array<T, C>) {
+        if self.slot().release() {
+            let shard = shards
+                .get(C::unpack_tid(self.key).as_usize())
+                .expect("the shard of a referenced slot exists");
+            // SAFETY: releasing the last reference claimed the slot.
+            unsafe { shard.free_key(self.key) };
+        }
+    }
+}
+
+impl<T: Clear, C: cfg::Config> fmt::Debug for SlotRef<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotRef")
+            .field("key", &format_args!("{:#x}", self.key))
+            .field("slot", self.slot())
+            .finish()
+    }
+}
+
 // === impl InitGuard ===
 
 impl<T: Clear, C: cfg::Config> InitGuard<T, C> {

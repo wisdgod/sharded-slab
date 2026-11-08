@@ -1,4 +1,4 @@
-use std::{fmt, iter::FusedIterator, marker::PhantomData, ptr::NonNull, slice};
+use std::{fmt, iter::FusedIterator, marker::PhantomData, slice};
 
 use crate::{DefaultConfig, Entry, Slab, cfg, page, page::slot::Value, shard};
 
@@ -60,13 +60,8 @@ impl<'a, T, C: cfg::Config> Iterator for Iter<'a, T, C> {
     type Item = Entry<'a, T, C>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let inner = self.inner.next()?;
-        // SAFETY: a guard is only acquired for a published value, which is
-        // initialized.
-        let value = NonNull::from(unsafe { inner.value().get() });
         Some(Entry {
-            inner,
-            value,
+            inner: self.inner.next()?,
             _slab: PhantomData,
         })
     }

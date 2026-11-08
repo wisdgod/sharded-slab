@@ -227,7 +227,7 @@ pub(crate) use tid::Tid;
 
 use cfg::{CfgPrivate, WIDTH};
 use page::slot::Value;
-use std::{fmt, marker::PhantomData, ops::Deref, ptr::NonNull, sync::Arc};
+use std::{fmt, marker::PhantomData, ops::Deref, sync::Arc};
 
 type SlabGuard<T, C> = shard::Guard<Value<T>, C>;
 
@@ -247,7 +247,6 @@ pub struct Slab<T, C: cfg::Config = DefaultConfig> {
 /// dropped.
 pub struct Entry<'a, T, C: cfg::Config = DefaultConfig> {
     inner: SlabGuard<T, C>,
-    value: NonNull<T>,
     _slab: PhantomData<&'a Slab<T, C>>,
 }
 
@@ -366,10 +365,9 @@ pub struct OwnedEntry<T, C = DefaultConfig>
 where
     C: cfg::Config,
 {
-    // Declared before `_slab`, so that the guard is dropped first.
-    inner: SlabGuard<T, C>,
-    value: NonNull<T>,
-    _slab: Arc<Slab<T, C>>,
+    /// Released on drop, before `slab` is dropped.
+    inner: shard::SlotRef<Value<T>, C>,
+    slab: Arc<Slab<T, C>>,
 }
 
 impl<T> Slab<T> {
@@ -589,10 +587,8 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// ```
     #[inline]
     pub fn get(&self, key: usize) -> Option<Entry<'_, T, C>> {
-        let (inner, value) = self.guard(key)?;
         Some(Entry {
-            inner,
-            value,
+            inner: self.guard(key)?,
             _slab: PhantomData,
         })
     }
@@ -679,11 +675,9 @@ impl<T, C: cfg::Config> Slab<T, C> {
     /// [`get`]: Slab::get
     /// [`Arc`]: std::sync::Arc
     pub fn get_owned(self: Arc<Self>, key: usize) -> Option<OwnedEntry<T, C>> {
-        let (inner, value) = self.guard(key)?;
         Some(OwnedEntry {
-            inner,
-            value,
-            _slab: self,
+            inner: self.guard(key)?.into_slot_ref(),
+            slab: self,
         })
     }
 
@@ -835,16 +829,13 @@ impl<T, C: cfg::Config> Slab<T, C> {
         }
     }
 
-    /// Acquires a guard for the value at `key`, and a pointer to the value.
+    /// Acquires a guard for the value at `key`.
     ///
     /// The slab must outlive the guard.
     #[inline]
-    fn guard(&self, key: usize) -> Option<(SlabGuard<T, C>, NonNull<T>)> {
+    fn guard(&self, key: usize) -> Option<SlabGuard<T, C>> {
         test_println!("get {:?}", C::unpack_tid(key));
-        let guard = self.shards.get(C::unpack_tid(key).as_usize())?.get(key)?;
-        // SAFETY: a published value is initialized.
-        let value = NonNull::from(unsafe { guard.value().get() });
-        Some((guard, value))
+        self.shards.get(C::unpack_tid(key).as_usize())?.get(key)
     }
 }
 
@@ -853,8 +844,8 @@ impl<T, C: cfg::Config> Drop for Slab<T, C> {
         for shard in self.shards.iter_mut() {
             for page in shard.iter() {
                 // SAFETY: `&mut self` guarantees no guard exists (an
-                // `OwnedEntry` drops its guard before its `Arc<Slab>`), and the
-                // values are not accessed again.
+                // `OwnedEntry` releases its reference before its `Arc<Slab>`
+                // is dropped), and the values are not accessed again.
                 unsafe { page.drop_values() };
             }
         }
@@ -914,9 +905,9 @@ impl<T, C: cfg::Config> Entry<'_, T, C> {
 
     #[inline(always)]
     fn value(&self) -> &T {
-        // SAFETY: `value` points into the slot that `inner` keeps referenced;
-        // it is cached to avoid unwrapping the `Option` on every access.
-        unsafe { self.value.as_ref() }
+        // SAFETY: a guard is only acquired for a published value, which is
+        // initialized.
+        unsafe { self.inner.value().get() }
     }
 }
 
@@ -925,7 +916,6 @@ impl<T, C: cfg::Config> Clone for Entry<'_, T, C> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            value: self.value,
             _slab: PhantomData,
         }
     }
@@ -1030,9 +1020,9 @@ where
 
     #[inline(always)]
     fn value(&self) -> &T {
-        // SAFETY: `value` points into the slot that `inner` keeps referenced;
-        // it is cached to avoid unwrapping the `Option` on every access.
-        unsafe { self.value.as_ref() }
+        // SAFETY: a reference is only acquired for a published value, which is
+        // initialized.
+        unsafe { self.inner.value().get() }
     }
 }
 
@@ -1040,10 +1030,17 @@ where
 impl<T, C: cfg::Config> Clone for OwnedEntry<T, C> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            value: self.value,
-            _slab: self._slab.clone(),
+            inner: self.inner.clone_ref(),
+            slab: self.slab.clone(),
         }
+    }
+}
+
+impl<T, C: cfg::Config> Drop for OwnedEntry<T, C> {
+    fn drop(&mut self) {
+        // SAFETY: the slot is in `slab`, which is dropped after this, and
+        // `inner` is not used again.
+        unsafe { self.inner.release(&self.slab.shards) }
     }
 }
 

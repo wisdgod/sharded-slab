@@ -48,6 +48,9 @@ upstream repository.
     a single atomic operation.
 *   `contains` is a single atomic load; releasing guards and removing values no
     longer register the calling thread.
+*   `Entry` and `OwnedEntry` are three words instead of four. They no longer
+    cache a pointer to the value: with values in `MaybeUninit`, reaching one
+    through its slot is only an offset.
 
 #### Other
 

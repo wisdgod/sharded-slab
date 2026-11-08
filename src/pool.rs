@@ -213,9 +213,9 @@ where
     T: Clear + Default,
     C: cfg::Config,
 {
-    // Declared before `_pool`, so that the guard is dropped first.
-    inner: shard::Guard<T, C>,
-    _pool: Arc<Pool<T, C>>,
+    /// Released on drop, before `pool` is dropped.
+    inner: shard::SlotRef<T, C>,
+    pool: Arc<Pool<T, C>>,
 }
 
 /// An owned guard that allows exclusive, mutable access to an object in a pool.
@@ -764,8 +764,8 @@ where
     /// [`Ref`]: crate::pool::Ref
     pub fn get_owned(self: Arc<Self>, key: usize) -> Option<OwnedRef<T, C>> {
         Some(OwnedRef {
-            inner: self.guard(key)?,
-            _pool: self,
+            inner: self.guard(key)?.into_slot_ref(),
+            pool: self,
         })
     }
 
@@ -1080,9 +1080,21 @@ where
 impl<T: Clear + Default, C: cfg::Config> Clone for OwnedRef<T, C> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            _pool: self._pool.clone(),
+            inner: self.inner.clone_ref(),
+            pool: self.pool.clone(),
         }
+    }
+}
+
+impl<T, C> Drop for OwnedRef<T, C>
+where
+    T: Clear + Default,
+    C: cfg::Config,
+{
+    fn drop(&mut self) {
+        // SAFETY: the slot is in `pool`, which is dropped after this, and
+        // `inner` is not used again.
+        unsafe { self.inner.release(&self.pool.shards) }
     }
 }
 
@@ -1171,8 +1183,8 @@ where
         // moved out exactly once.
         let (inner, pool) = unsafe { (ManuallyDrop::take(&mut this.inner), ptr::read(&this.pool)) };
         OwnedRef {
-            inner: inner.downgrade(),
-            _pool: pool,
+            inner: inner.downgrade().into_slot_ref(),
+            pool,
         }
     }
 
